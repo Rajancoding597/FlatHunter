@@ -2,6 +2,7 @@ from aiogram.fsm.state import State, StatesGroup
 
 class RenterState(StatesGroup):
     waiting_for_requirement = State()
+    collecting_extras = State()
     confirming_requirement = State()
     waiting_for_availability = State()
 

@@ -31,10 +31,10 @@ class SchedulingService:
         }).eq("id", str(visit_id)).execute()
 
     async def parse_and_save_availability(self, user_id: UUID, search_id: UUID, text: str):
-        from app.llm.gemini import GeminiProvider
+        from app.llm.gemini import get_llm_provider
         from app.scheduling.schemas import RenterAvailabilityExtraction
         
-        llm = GeminiProvider()
+        llm = get_llm_provider()
         prompt = f"""
         Parse the user's availability for flat visits from the following text:
         "{text}"

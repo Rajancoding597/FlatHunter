@@ -11,15 +11,19 @@ class MatchingEngine:
         # Very simplified deterministic match
         rejections = []
         
-        # Hard constraint: rent limit
-        if listing['rent'] > search_req['max_rent']:
-            rejections.append("Rent exceeds maximum allowed.")
-            
         # Hard constraint: listing type
-        if listing['listing_type'] not in search_req['listing_types']:
-            rejections.append(f"Listing type {listing['listing_type']} is not preferred.")
+        if listing.get('listing_type') not in search_req.get('listing_types', []):
+            rejections.append(f"Listing type {listing.get('listing_type')} is not preferred.")
             
         if rejections:
+            return MatchStatus.REJECTED, 0.0
+            
+        # Check if qualification is needed
+        if listing.get('rent') is None:
+            return MatchStatus.NEEDS_QUALIFICATION, 0.0
+            
+        # Hard constraint: rent limit
+        if listing['rent'] > search_req['max_rent']:
             return MatchStatus.REJECTED, 0.0
             
         # Calculate fit score

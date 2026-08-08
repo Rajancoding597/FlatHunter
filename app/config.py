@@ -6,7 +6,9 @@ class Settings(BaseSettings):
     admin_telegram_ids: List[int]
     supabase_url: str
     supabase_service_key: str
-    gemini_api_key: str
+    gemini_api_key: str = ""
+    groq_api_key: str = ""
+    llm_provider: str = "groq"  # "groq" or "gemini"
     
     flathunter_default_city: str = "Hyderabad"
     flathunter_default_timezone: str = "Asia/Kolkata"

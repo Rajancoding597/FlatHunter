@@ -1,13 +1,13 @@
 import json
 from uuid import UUID
 from app.db.client import get_supabase_client
-from app.llm.gemini import GeminiProvider
+from app.llm.gemini import get_llm_provider
 from app.common.enums import ConversationStatus
 
 class QualificationService:
     def __init__(self):
         self.db = get_supabase_client()
-        self.llm = GeminiProvider()
+        self.llm = get_llm_provider()
 
     def start_conversation(self, search_id: UUID, listing_id: UUID, contact_id: UUID) -> UUID:
         res = self.db.table("conversations").insert({

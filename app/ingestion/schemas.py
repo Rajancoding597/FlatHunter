@@ -11,11 +11,11 @@ class ListingExtractionResponse(BaseModel):
     listing_type: str = Field(description="ENTIRE_PROPERTY, PRIVATE_ROOM, SHARED_ROOM")
     city: str
     locality: str
-    rent: int
+    rent: Optional[int] = Field(default=None, description="MUST be null if not specified, do NOT guess or put 0")
     deposit: Optional[int] = None
     maintenance: Optional[int] = None
     brokerage: Optional[int] = None
-    available_from: Optional[str] = None
+    available_from: Optional[str] = Field(default=None, description="MUST be in YYYY-MM-DD format if known, otherwise null")
     furnishing: Optional[str] = None
     attached_bathroom: Optional[bool] = None
     car_parking: Optional[bool] = None
