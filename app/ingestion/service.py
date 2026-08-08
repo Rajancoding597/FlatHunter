@@ -108,6 +108,7 @@ class IngestionService:
         }).execute()
         
         # Mark draft and session
+        self.db.table("listing_drafts").update({"extraction_status": "APPROVED"}).eq("id", str(draft_id)).execute()
         self.db.table("ingestion_sessions").update({"status": IngestionStatus.APPROVED.value}).eq("id", draft["ingestion_session_id"]).execute()
         
         return listing_id

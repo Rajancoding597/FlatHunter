@@ -21,35 +21,78 @@ class GroqProvider:
         schema_json = schema.model_json_schema()
         schema_name = getattr(schema, "__name__", str(schema))
         
+        has_images = False
+        current_model = self.model_name
+        
         if isinstance(prompt, list):
-            # For multimodal prompts (images), convert to text description
-            text_parts = [p for p in prompt if isinstance(p, str)]
-            prompt_text = "\n".join(text_parts)
+            has_images = any(isinstance(p, dict) and 'mime_type' in p for p in prompt)
+            
+            if has_images:
+                # Switch to Groq's free vision model
+                current_model = "llama-3.2-90b-vision-preview"
+                content_array = []
+                for p in prompt:
+                    if isinstance(p, str):
+                        content_array.append({"type": "text", "text": p})
+                    elif isinstance(p, dict) and 'mime_type' in p and 'data' in p:
+                        import base64
+                        b64 = base64.b64encode(p['data']).decode('utf-8') if isinstance(p['data'], bytes) else p['data']
+                        content_array.append({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{p['mime_type']};base64,{b64}"
+                            }
+                        })
+                content_array.append({"type": "text", "text": f"\n\nIMPORTANT: Return ONLY a valid JSON object matching exactly this schema. No markdown, no backticks:\n{json.dumps(schema_json)}"})
+                user_message = {"role": "user", "content": content_array}
+                prompt_text = "[Multimodal input with images]"
+            else:
+                text_parts = [p for p in prompt if isinstance(p, str)]
+                prompt_text = "\n".join(text_parts)
+                prompt_text += f"\n\nIMPORTANT: Return ONLY a valid JSON object matching exactly this schema. No markdown, no backticks:\n{json.dumps(schema_json)}"
+                user_message = {"role": "user", "content": prompt_text}
         else:
             prompt_text = str(prompt)
-        
-        prompt_text += f"\n\nIMPORTANT: Return ONLY a valid JSON object matching exactly this schema. No markdown, no backticks:\n{json.dumps(schema_json)}"
+            prompt_text += f"\n\nIMPORTANT: Return ONLY a valid JSON object matching exactly this schema. No markdown, no backticks:\n{json.dumps(schema_json)}"
+            user_message = {"role": "user", "content": prompt_text}
         
         start_time = time.perf_counter()
         for attempt in range(self.max_retries):
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[
+                kwargs = {
+                    "model": current_model,
+                    "messages": [
                         {"role": "system", "content": "You are a precise data extraction assistant. Always respond with valid JSON only."},
-                        {"role": "user", "content": prompt_text}
+                        user_message
                     ],
-                    response_format={"type": "json_object"},
-                    temperature=0.1,
-                )
+                    "temperature": 0.1,
+                }
+                
+                # Vision models on Groq sometimes don't support json_object format flag yet, 
+                # so we only enforce it for text models.
+                if not has_images:
+                    kwargs["response_format"] = {"type": "json_object"}
+                    
+                response = self.client.chat.completions.create(**kwargs)
                 raw_text = response.choices[0].message.content
+                
+                # Clean up markdown if present
+                raw_text = raw_text.strip()
+                if raw_text.startswith("```json"):
+                    raw_text = raw_text[7:]
+                if raw_text.startswith("```"):
+                    raw_text = raw_text[3:]
+                if raw_text.endswith("```"):
+                    raw_text = raw_text[:-3]
+                raw_text = raw_text.strip()
+                
                 data = json.loads(raw_text)
                 parsed_obj = schema(**data)
                 
                 elapsed_ms = (time.perf_counter() - start_time) * 1000
                 tracer.log_llm_call(
                     provider="groq",
-                    model=self.model_name,
+                    model=current_model,
                     prompt=prompt_text,
                     response=parsed_obj,
                     latency_ms=elapsed_ms,

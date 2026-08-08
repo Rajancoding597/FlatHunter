@@ -15,7 +15,15 @@ async def lifespan(app: FastAPI):
     bot, dp = await init_bot()
     
     # Start bot polling in background
-    polling_task = asyncio.create_task(dp.start_polling(bot))
+    async def start_bot_polling():
+        try:
+            await dp.start_polling(bot)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Bot polling stopped with error: {e}")
+
+    polling_task = asyncio.create_task(start_bot_polling())
     
     # Start worker loop in background
     worker = JobWorker()

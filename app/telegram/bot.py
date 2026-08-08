@@ -25,6 +25,7 @@ async def init_bot() -> tuple[Bot, Dispatcher]:
     default_commands = [
         BotCommand(command="mysearch", description="Check status & matches of your search"),
         BotCommand(command="start", description="Start or restart your flat search"),
+        BotCommand(command="cancel_search", description="Cancel your active search"),
         BotCommand(command="set_availability", description="Set your availability for visits"),
         BotCommand(command="help", description="Show available commands"),
     ]
@@ -34,6 +35,9 @@ async def init_bot() -> tuple[Bot, Dispatcher]:
         BotCommand(command="addlisting", description="Add a new property"),
         BotCommand(command="bulkadd", description="Add multiple properties"),
         BotCommand(command="status", description="View system metrics"),
+        BotCommand(command="viewsearches", description="View active renters' searches"),
+        BotCommand(command="viewlistings", description="View recent active listings"),
+        BotCommand(command="viewdrafts", description="View pending drafts"),
         BotCommand(command="help", description="Show admin commands"),
     ]
     

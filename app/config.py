@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     flathunter_default_timezone: str = "Asia/Kolkata"
     listing_stale_after_days: int = 7
     follow_up_after_hours: int = 24
+    max_active_searches: int = 1
     
     # Email settings (optional, can be empty string if not provided)
     smtp_server: str = ""

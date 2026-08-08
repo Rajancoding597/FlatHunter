@@ -1,12 +1,13 @@
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.utils.chat_action import ChatActionSender
 from aiogram.enums import ChatAction
 from app.telegram.states import RenterState
 from app.requirements.service import RequirementService
 from app.db.client import get_supabase_client
+from app.common.tracer import tracer
 from uuid import uuid4
 
 router = Router()
@@ -32,10 +33,35 @@ async def get_or_create_user(message: Message) -> str:
     }).execute()
     return new_user.data[0]['id']
 
+async def check_and_handle_active_searches(message: Message, state: FSMContext) -> bool:
+    """Returns True if the limit is hit and we are awaiting confirmation, False otherwise."""
+    user_id = await get_or_create_user(message)
+    db = get_supabase_client()
+    
+    # Get active searches
+    res = db.table("search_sessions").select("id").eq("user_id", user_id).eq("status", "ACTIVE").execute()
+    active_count = len(res.data) if res.data else 0
+    
+    from app.config import settings
+    if active_count >= settings.max_active_searches:
+        await message.answer(
+            f"⚠️ You currently have an active search running!\n\n"
+            f"In this early version, we only support {settings.max_active_searches} active search(es) at a time. "
+            "Would you like to cancel your current search and start a new one? (Yes/No)"
+        )
+        await state.set_state(RenterState.confirming_new_search_override)
+        tracer.log_event("SEARCH_LIMIT_HIT", message.from_user.id, {"active_count": active_count, "limit": settings.max_active_searches})
+        return True
+    
+    return False
+
 # ─── COMMANDS (registered FIRST so they aren't swallowed by FSM states) ───
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
+    if await check_and_handle_active_searches(message, state):
+        return
+        
     await state.clear()
     await message.answer(
         "👋 Hey there! I'm FlatHunter, your personal flat-finding assistant.\n\n"
@@ -44,6 +70,23 @@ async def cmd_start(message: Message, state: FSMContext):
     )
     await state.set_state(RenterState.waiting_for_requirement)
     await state.update_data(chat_history=[])
+
+@router.message(Command("cancel_search"))
+async def cmd_cancel_search(message: Message, state: FSMContext):
+    user_id = await get_or_create_user(message)
+    db = get_supabase_client()
+    
+    # Close active searches
+    res = db.table("search_sessions").update({"status": "CLOSED"}).eq("user_id", user_id).eq("status", "ACTIVE").execute()
+    
+    if res.data:
+        count = len(res.data)
+        tracer.log_event("SEARCH_CANCELLED", message.from_user.id, {"count": count})
+        await message.answer(f"✅ Your active search has been cancelled. You won't receive any more alerts for it.")
+    else:
+        await message.answer("You don't have any active searches right now!")
+        
+    await state.clear()
 
 @router.message(Command("help"))
 async def cmd_help(message: Message, state: FSMContext):
@@ -57,6 +100,7 @@ async def cmd_help(message: Message, state: FSMContext):
             "• <i>\"Private room near HITEC City, furnished\"</i>\n\n"
             "<b>Commands:</b>\n"
             "/start - Restart the search\n"
+            "/cancel_search - Cancel your active search\n"
             "/help - Show this message"
         )
     elif current_state == RenterState.collecting_extras.state:
@@ -68,6 +112,7 @@ async def cmd_help(message: Message, state: FSMContext):
             "Or say <b>\"start searching\"</b> to begin!\n\n"
             "<b>Commands:</b>\n"
             "/start - Restart the search\n"
+            "/cancel_search - Cancel your active search\n"
             "/help - Show this message"
         )
     else:
@@ -77,6 +122,7 @@ async def cmd_help(message: Message, state: FSMContext):
             "<b>Commands:</b>\n"
             "/mysearch - Check status & matches of your active search\n"
             "/start - Start or restart your flat search\n"
+            "/cancel_search - Cancel your active search\n"
             "/set_availability - Set when you're free for visits\n"
             "/help - Show this message\n\n"
             "Just say <b>hi</b> to get started!"
@@ -116,8 +162,16 @@ async def cmd_mysearch(message: Message):
     qualifying_matches = len([m for m in matches_res.data if m.get("status") == "NEEDS_QUALIFICATION"])
     
     locations = ", ".join(req.get("preferred_locations", [])) or "Anywhere in Hyderabad"
-    types = ", ".join(req.get("listing_types", [])) or "Any"
+    
+    types_list = req.get("listing_types") or []
+    config_list = req.get("preferred_property_configurations") or []
+    combined_types = [t for t in types_list + config_list if t]
+    types = ", ".join(combined_types) if combined_types else "Any"
+    
     budget = f"Up to ₹{req.get('max_rent'):,}" if req.get("max_rent") and req.get("max_rent") < 999999 else "Not specified"
+    
+    prefs = req.get("core_preferences", {})
+    prefs_str = ", ".join([f"{k} (Required)" if isinstance(v, dict) and v.get("importance") == "REQUIRED" else k for k, v in prefs.items()]) if prefs else "None"
     
     status_icon = "🟢 ACTIVE" if search_session.get("status") == "ACTIVE" else f"⚪ {search_session.get('status')}"
     
@@ -126,7 +180,8 @@ async def cmd_mysearch(message: Message):
         f"<b>Status:</b> {status_icon}\n"
         f"<b>Locations:</b> {locations}\n"
         f"<b>Property Type:</b> {types}\n"
-        f"<b>Budget:</b> {budget}\n\n"
+        f"<b>Budget:</b> {budget}\n"
+        f"<b>Preferences:</b> {prefs_str}\n\n"
         f"<b>📊 Progress:</b>\n"
         f"• 🎯 Direct Strong Matches: <b>{strong_matches}</b>\n"
         f"• ⏳ Properties In Qualification: <b>{qualifying_matches}</b>\n\n"
@@ -144,6 +199,9 @@ async def cmd_set_availability(message: Message, state: FSMContext):
 
 @router.message(F.text.lower().in_({"hi", "hello", "hey", "get started", "hey bot"}))
 async def greeting_start(message: Message, state: FSMContext):
+    if await check_and_handle_active_searches(message, state):
+        return
+        
     await state.clear()
     await message.answer(
         "👋 Hey there! I'm FlatHunter, your personal flat-finding assistant.\n\n"
@@ -154,6 +212,26 @@ async def greeting_start(message: Message, state: FSMContext):
     await state.update_data(chat_history=[])
 
 # ─── FSM STATE HANDLERS ───
+
+@router.message(RenterState.confirming_new_search_override)
+async def process_new_search_override(message: Message, state: FSMContext):
+    user_text = message.text.strip().lower()
+    
+    if user_text in ["yes", "y", "yeah", "yep", "cancel", "sure", "ok", "okay"]:
+        user_id = await get_or_create_user(message)
+        db = get_supabase_client()
+        
+        # Close active searches
+        res = db.table("search_sessions").update({"status": "CLOSED"}).eq("user_id", user_id).eq("status", "ACTIVE").execute()
+        
+        tracer.log_event("SEARCH_OVERRIDDEN", message.from_user.id, {"count": len(res.data) if res.data else 0})
+        
+        await message.answer("✅ Previous search cancelled! Let's start fresh.\n\nTell me what you're looking for (area, budget, etc.):")
+        await state.set_state(RenterState.waiting_for_requirement)
+        await state.update_data(chat_history=[])
+    else:
+        await message.answer("Got it! I will keep your current search running. You can type /mysearch to check its status.")
+        await state.clear()
 
 @router.message(RenterState.waiting_for_requirement)
 async def process_requirement(message: Message, state: FSMContext):
@@ -181,12 +259,18 @@ async def process_requirement(message: Message, state: FSMContext):
             return
             
         summary = parsed_reqs.conversational_summary or "Got it! I have all the details I need."
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🚀 Start Search", callback_data="action_start_search")]
+        ])
+        
         await message.answer(
             f"{summary}\n\n"
             "Anything else you'd like me to keep in mind? "
             "(e.g. furnished, no brokerage, near metro, parking)\n\n"
-            "Or just say <b>\"start searching\"</b> and I'll begin right away! 🚀",
-            parse_mode="HTML"
+            "Or click the button below to begin right away!",
+            parse_mode="HTML",
+            reply_markup=keyboard
         )
         
         await state.update_data(
@@ -217,6 +301,12 @@ async def process_extras(message: Message, state: FSMContext):
             
         full_conversation = data.get("full_conversation", "\n".join(chat_history))
         session = req_service.create_search(user_id, parsed_reqs, full_conversation)
+        tracer.log_event(
+            event_type="SEARCH_STARTED",
+            override_telegram_user_id=message.from_user.id,
+            payload={"search_id": str(session.id)},
+            override_search_id=str(session.id)
+        )
         
         await message.answer(
             "🚀 <b>Your search is live!</b>\n\n"
@@ -237,10 +327,15 @@ async def process_extras(message: Message, state: FSMContext):
         async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
             parsed_reqs = await req_service.parse_requirements(full_conversation)
         
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🚀 Start Search", callback_data="action_start_search")]
+        ])
+        
         await message.answer(
             "✅ Noted! I'll factor that into your search.\n\n"
-            "Anything else? Or say <b>\"start searching\"</b> to begin! 🚀",
-            parse_mode="HTML"
+            "Anything else? Or click below to begin! 🚀",
+            parse_mode="HTML",
+            reply_markup=keyboard
         )
         
         chat_history.append(f"Bot: Noted! I'll factor that into your search.")
@@ -268,6 +363,45 @@ async def process_availability(message: Message, state: FSMContext):
         await message.answer(f"Failed to save availability: {e}")
     finally:
         await state.clear()
+
+@router.callback_query(F.data == "action_start_search")
+async def process_start_search_callback(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if "parsed_reqs" not in data:
+        await callback.answer("Oops! Something went wrong. Try restarting with /start.", show_alert=True)
+        return
+        
+    chat_history = data.get("chat_history", [])
+    user_id = data.get("user_id")
+    
+    from app.requirements.schemas import RequirementExtractionResponse
+    parsed_reqs = RequirementExtractionResponse(**data["parsed_reqs"])
+    
+    if parsed_reqs.max_rent is None:
+        parsed_reqs.max_rent = 999999
+        
+    full_conversation = data.get("full_conversation", "\n".join(chat_history))
+    session = req_service.create_search(user_id, parsed_reqs, full_conversation)
+    tracer.log_event(
+        event_type="SEARCH_STARTED",
+        override_telegram_user_id=callback.from_user.id,
+        payload={"search_id": str(session.id)},
+        override_search_id=str(session.id)
+    )
+    
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+        
+    await callback.message.answer(
+        "🚀 <b>Your search is live!</b>\n\n"
+        "I'll message you right here as soon as I find a matching property. "
+        "Sit back and relax — I'm on it!",
+        parse_mode="HTML"
+    )
+    await state.clear()
+    await callback.answer()
 
 # ─── CALLBACK QUERIES ───
 

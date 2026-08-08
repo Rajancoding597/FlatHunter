@@ -85,8 +85,25 @@ class JobWorker:
             
             telegram_user_id = user_res.data[0]['telegram_user_id']
             
+            # Fetch listing details
+            listing_res = self.db.table("listings").select("*").eq("id", listing_id).execute()
+            if not listing_res.data:
+                return
+            listing = listing_res.data[0]
+            
+            config = listing.get('property_configuration') or listing.get('listing_type', 'Property')
+            loc = listing.get('locality') or listing.get('location_text') or listing.get('city') or 'Unknown'
+            rent = f"₹{listing.get('rent'):,}" if listing.get('rent') else "Not specified"
+            furnishing = listing.get('furnishing') or "Not specified"
+            
             # Message to send
-            message_text = f"🔥 We found a STRONG MATCH for your search!\n\nListing ID: {listing_id}\n\nDo you want us to contact them?"
+            message_text = (
+                f"🔥 <b>We found a STRONG MATCH for your search!</b>\n\n"
+                f"🌟 <b>{config} in {loc}</b>\n"
+                f"💰 <b>Rent:</b> {rent}\n"
+                f"🛋️ <b>Furnishing:</b> {furnishing}\n\n"
+                f"Do you want us to contact the landlord on your behalf?"
+            )
             
             # Initialize bot just for sending message
             from aiogram import Bot
@@ -100,7 +117,7 @@ class JobWorker:
             
             import asyncio
             try:
-                await bot.send_message(chat_id=telegram_user_id, text=message_text, reply_markup=keyboard)
+                await bot.send_message(chat_id=telegram_user_id, text=message_text, reply_markup=keyboard, parse_mode="HTML")
             finally:
                 await bot.session.close()
             
@@ -159,6 +176,11 @@ class JobWorker:
                 
                 adapter = EmailAdapter()
                 await adapter.send(email, f"Hi,\n\nThe renter has confirmed the visit for {visit['confirmed_start']}. See you then!\n\nBest,\nFlatHunter", {"conversation_id": conv['id']})
+                
+        elif job_type == "SEARCH_CREATED":
+            search_id = payload['search_id']
+            logger.info(f"Processing SEARCH_CREATED for search {search_id}")
+            self.matching_engine.process_new_search(search_id)
             
         else:
             logger.warning(f"Unknown job type: {job_type}")

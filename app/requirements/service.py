@@ -62,10 +62,25 @@ class RequirementService:
             "search_id": str(session.id),
             "listing_types": requirement_data.listing_types,
             "preferred_locations": requirement_data.preferred_locations,
+            "acceptable_locations": requirement_data.acceptable_locations,
+            "excluded_locations": requirement_data.excluded_locations,
+            "work_location": requirement_data.work_location,
             "target_rent": requirement_data.target_rent,
             "max_rent": requirement_data.max_rent,
+            "preferred_move_in_date": requirement_data.preferred_move_in_date,
+            "latest_move_in_date": requirement_data.latest_move_in_date,
+            "preferred_property_configurations": requirement_data.preferred_property_configurations,
+            "additional_preferences": requirement_data.additional_preferences,
             "raw_requirement_text": raw_text,
             "core_preferences": {k: v.dict() for k,v in requirement_data.core_preferences.items()}
+        }).execute()
+        
+        # Trigger background retroactive matching
+        self.db.table("agent_jobs").insert({
+            "job_type": "SEARCH_CREATED",
+            "status": "PENDING",
+            "payload": {"search_id": str(session.id)},
+            "run_after": "now()"
         }).execute()
 
         return session
