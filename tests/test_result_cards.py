@@ -34,7 +34,11 @@ def test_match_actions_fit_telegram_callback_limit_and_use_only_match_id():
     keyboard = _match_action_keyboard(match_id)
     callback_data = [button.callback_data for row in keyboard.inline_keyboard for button in row]
 
-    assert callback_data == [f"contact_match_{match_id}", f"skip_match_{match_id}"]
+    assert callback_data == [
+        f"details_match_{match_id}",
+        f"contact_match_{match_id}",
+        f"skip_match_{match_id}",
+    ]
     assert all(len(value.encode("utf-8")) <= 64 for value in callback_data)
 
 

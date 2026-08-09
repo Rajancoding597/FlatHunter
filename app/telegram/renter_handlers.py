@@ -158,6 +158,9 @@ async def cmd_help(message: Message, state: FSMContext):
             "<b>Commands:</b>\n"
             "/mysearch - Check status & matches of your active search\n"
             "/start - Start or restart your flat search\n"
+            "/editsearch - Update your saved search\n"
+            "/pause - Pause alerts and outreach\n"
+            "/resume - Resume your paused search\n"
             "/cancel_search - Cancel your active search\n"
             "/set_availability - Set when you're free for visits\n"
             "/help - Show this message\n\n"
@@ -508,13 +511,50 @@ def _match_id_from_callback(callback_data: str | None, action: str) -> str | Non
 
 async def _callback_owned_match(callback: CallbackQuery, match_id: str) -> dict | None:
     db = get_supabase_client()
-    result = db.table("matches").select("id,search_id,listing_id").eq("id", match_id).execute()
+    result = db.table("matches").select(
+        "id,search_id,listing_id,missing_information"
+    ).eq("id", match_id).execute()
     if not result.data:
         return None
     match = result.data[0]
     if not await _callback_owns_search(callback, match["search_id"]):
         return None
     return match
+
+
+@router.callback_query(F.data.startswith("details_match_"))
+async def process_property_details_callback(callback: CallbackQuery):
+    match_id = _match_id_from_callback(callback.data, "details")
+    match = await _callback_owned_match(callback, match_id) if match_id else None
+    if not match:
+        await callback.answer("These property details are not available for your search.", show_alert=True)
+        return
+
+    listing_result = get_supabase_client().table("listings").select("*").eq(
+        "id", match["listing_id"]
+    ).execute()
+    if not listing_result.data:
+        await callback.answer("This property is no longer available.", show_alert=True)
+        return
+
+    await callback.answer()
+    from app.matching.details import clarification_labels, draft_property_narrative, message_chunks
+
+    narrative = await draft_property_narrative(listing_result.data[0])
+    clarifications = clarification_labels(match.get("missing_information"))
+    if clarifications:
+        missing_section = (
+            "Still to confirm with the owner or agent:\n"
+            + "\n".join(f"• {item}" for item in clarifications)
+            + "\n\nIf you choose Contact owner / agent, FlatHunter's agent will collect these clarifications "
+              "and update you here."
+        )
+    else:
+        missing_section = "No renter-specific owner clarifications are currently outstanding."
+
+    response = f"Full property details\n\n{narrative}\n\n{missing_section}"
+    for chunk in message_chunks(response):
+        await callback.message.answer(chunk, parse_mode=None)
 
 
 @router.callback_query(F.data.startswith("contact_match_"))

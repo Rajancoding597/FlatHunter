@@ -16,12 +16,14 @@ def _match_action_keyboard(match_id: str):
     """Build renter actions using one UUID so Telegram's 64-byte limit is respected."""
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+    details_data = f"details_match_{match_id}"
     contact_data = f"contact_match_{match_id}"
     skip_data = f"skip_match_{match_id}"
-    for callback_data in (contact_data, skip_data):
+    for callback_data in (details_data, contact_data, skip_data):
         if len(callback_data.encode("utf-8")) > TELEGRAM_CALLBACK_DATA_MAX_BYTES:
             raise ValueError("Match callback data exceeds Telegram's 64-byte limit")
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="View full property details", callback_data=details_data)],
         [InlineKeyboardButton(text="Contact owner / agent", callback_data=contact_data)],
         [InlineKeyboardButton(text="Not interested", callback_data=skip_data)],
     ])
@@ -190,10 +192,13 @@ class JobWorker:
             search_id = payload['search_id']
             listing_id = payload['listing_id']
 
-            match_res = self.db.table("matches").select("id").eq("search_id", search_id).eq("listing_id", listing_id).limit(1).execute()
+            match_res = self.db.table("matches").select(
+                "id,status,fit_score,positive_reasons,missing_information"
+            ).eq("search_id", search_id).eq("listing_id", listing_id).limit(1).execute()
             if not match_res.data:
                 raise RuntimeError(f"Match not found for renter notification: {search_id}/{listing_id}")
-            match_id = str(match_res.data[0]["id"])
+            match = match_res.data[0]
+            match_id = str(match["id"])
             
             # Fetch user ID from search_id
             search_res = self.db.table("search_sessions").select("user_id").eq("id", search_id).execute()
@@ -212,19 +217,7 @@ class JobWorker:
                 return
             listing = listing_res.data[0]
             
-            config = listing.get('property_configuration') or listing.get('listing_type', 'Property')
-            loc = listing.get('locality') or listing.get('location_text') or listing.get('city') or 'Unknown'
-            rent = f"₹{listing.get('rent'):,}" if listing.get('rent') else "Not specified"
-            furnishing = listing.get('furnishing') or "Not specified"
-            
-            # Message to send
-            message_text = (
-                f"🔥 <b>We found a STRONG MATCH for your search!</b>\n\n"
-                f"🌟 <b>{config} in {loc}</b>\n"
-                f"💰 <b>Rent:</b> {rent}\n"
-                f"🛋️ <b>Furnishing:</b> {furnishing}\n\n"
-                f"Do you want us to contact the landlord on your behalf?"
-            )
+            message_text = self.build_match_card(1, match, listing)
             
             # Initialize bot just for sending message
             from aiogram import Bot

@@ -5,9 +5,9 @@ from app.llm.gemini import get_llm_provider
 from app.common.enums import ConversationStatus
 
 class QualificationService:
-    def __init__(self):
-        self.db = get_supabase_client()
-        self.llm = get_llm_provider()
+    def __init__(self, db=None, llm=None):
+        self.db = db if db is not None else get_supabase_client()
+        self.llm = llm if llm is not None else get_llm_provider()
 
     def start_conversation(self, search_id: UUID, listing_id: UUID, contact_id: UUID) -> UUID:
         res = self.db.table("conversations").insert({
@@ -22,12 +22,21 @@ class QualificationService:
         # Fetch conversation, listing and search requirements
         conv = self.db.table("conversations").select("*").eq("id", str(conversation_id)).execute().data[0]
         search_req = self.db.table("search_requirements").select("*").eq("search_id", conv['search_id']).execute().data[0]
-        
+        match_result = self.db.table("matches").select("missing_information").eq(
+            "search_id", conv["search_id"]
+        ).eq("listing_id", conv["listing_id"]).limit(1).execute()
+        from app.matching.details import clarification_labels
+
+        missing = clarification_labels(
+            match_result.data[0].get("missing_information") if match_result.data else []
+        )
         prompt = f"""
         Draft a polite initial message to the property owner/broker.
         Context: The renter is looking for {search_req['listing_types']} with budget {search_req['target_rent']}.
-        Goal: Ask if the property is still available and mention we are interested.
-        Keep it very short.
+        Goal: Mention that the renter is interested, ask whether the property is still available,
+        and ask for these unresolved facts: {json.dumps(missing, ensure_ascii=False)}.
+        Ask only for the supplied unresolved facts. Do not invent questions or property details.
+        Keep the message concise and natural. If the unresolved list is empty, only confirm availability.
         """
         response = await self.llm.generate_text(prompt)
         

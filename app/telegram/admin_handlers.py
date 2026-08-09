@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 
 from aiogram import Router, F
@@ -7,15 +8,29 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.context import FSMContext
 from aiogram.utils.chat_action import ChatActionSender
 from app.config import settings
-from app.telegram.states import AdminState, RenterState
+from app.telegram.states import AdminState
 from app.ingestion.service import DraftApprovalError, IngestionService
 from app.telegram.renter_handlers import get_or_create_user
+from app.telegram.command_menus import activate_admin_menu, activate_renter_menu, is_admin_menu_active
 
 router = Router()
 ingest_service = IngestionService()
+logger = logging.getLogger(__name__)
 
 def is_admin(user_id: int) -> bool:
     return user_id in settings.admin_telegram_ids
+
+
+def is_admin_interface(message: Message) -> bool:
+    return is_admin(message.from_user.id) and is_admin_menu_active(message.chat.id)
+
+
+def is_admin_callback_interface(callback: CallbackQuery) -> bool:
+    return (
+        is_admin(callback.from_user.id)
+        and callback.message is not None
+        and is_admin_menu_active(callback.message.chat.id)
+    )
 
 
 async def _load_information_images(message: Message, session_id: str) -> dict[str, bytes]:
@@ -144,24 +159,40 @@ async def _send_draft_preview(message: Message, draft_id: str) -> None:
 @router.message(Command("renter"), lambda msg: is_admin(msg.from_user.id))
 async def cmd_renter_mode(message: Message, state: FSMContext):
     """Let an authorized admin exercise the renter flow with the same Telegram account."""
+    if str(getattr(message.chat, "type", "private")) != "private":
+        await message.answer("Switch renter/admin controls in your private chat with FlatHunter.")
+        return
+    try:
+        await activate_renter_menu(message.bot, message.chat.id, admin_can_switch=True)
+    except Exception:
+        logger.exception("Could not switch admin chat to renter menu", extra={"chat_id": message.chat.id})
+        await message.answer("I could not switch the Telegram menu. Please try /renter again.")
+        return
     await get_or_create_user(message)
     await state.clear()
-    await state.set_state(RenterState.waiting_for_requirement)
-    await state.update_data(chat_history=[])
     await message.answer(
-        "Renter test mode is active for this chat. Tell me what flat you are looking for, "
-        "or use /start. Use /admin when you want to return to admin actions."
+        "Renter controls are active. Open the Telegram command menu to see every renter action, "
+        "use /start to begin testing, or /admin to switch back."
     )
 
 
 @router.message(Command("admin"), lambda msg: is_admin(msg.from_user.id))
 async def cmd_admin_mode(message: Message, state: FSMContext):
     """Exit a renter/admin FSM flow without changing the user's persisted role."""
+    if str(getattr(message.chat, "type", "private")) != "private":
+        await message.answer("Admin controls are available only in your private chat with FlatHunter.")
+        return
+    try:
+        await activate_admin_menu(message.bot, message.chat.id)
+    except Exception:
+        logger.exception("Could not switch chat to admin menu", extra={"chat_id": message.chat.id})
+        await message.answer("I could not switch the Telegram menu. Please try /admin again.")
+        return
     await state.clear()
-    await message.answer("Admin mode is active again. Use /help to view admin commands, or /renter to test the renter flow.")
+    await message.answer("Admin controls are active. Use /help to review them, or /renter to return to renter testing.")
 
 
-@router.message(Command("help"), StateFilter(None), lambda msg: is_admin(msg.from_user.id))
+@router.message(Command("help"), is_admin_interface)
 async def cmd_help(message: Message):
     if not is_admin(message.from_user.id):
         return
@@ -175,11 +206,12 @@ async def cmd_help(message: Message):
         "/viewlistings - View recent active listings\n"
         "/viewdrafts - Review, edit, approve, or reject pending drafts\n"
         "/sim_reply - Simulate an owner SMS reply\n"
+        "/renter - Switch back to renter controls\n"
         "/help - Show this message"
     )
     await message.answer(help_text, parse_mode="HTML")
 
-@router.message(Command("status"), lambda msg: is_admin(msg.from_user.id))
+@router.message(Command("status"), is_admin_interface)
 async def cmd_status(message: Message):
     from app.db.client import get_supabase_client
     db = get_supabase_client()
@@ -197,7 +229,7 @@ async def cmd_status(message: Message):
     )
     await message.answer(msg, parse_mode="HTML")
 
-@router.message(Command("viewsearches"), lambda msg: is_admin(msg.from_user.id))
+@router.message(Command("viewsearches"), is_admin_interface)
 async def cmd_view_searches(message: Message):
     from app.db.client import get_supabase_client
     db = get_supabase_client()
@@ -230,7 +262,7 @@ async def cmd_view_searches(message: Message):
         
     await message.answer("\n".join(lines), parse_mode="HTML")
 
-@router.message(Command("viewlistings"), lambda msg: is_admin(msg.from_user.id))
+@router.message(Command("viewlistings"), is_admin_interface)
 async def cmd_view_listings(message: Message):
     from app.db.client import get_supabase_client
     db = get_supabase_client()
@@ -256,7 +288,7 @@ async def cmd_view_listings(message: Message):
         
         await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
-@router.message(Command("viewdrafts"), lambda msg: is_admin(msg.from_user.id))
+@router.message(Command("viewdrafts"), is_admin_interface)
 async def cmd_view_drafts(message: Message):
     from app.db.client import get_supabase_client
     db = get_supabase_client()
@@ -283,7 +315,7 @@ async def cmd_view_drafts(message: Message):
         
         await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
-@router.message(Command("addlisting"), lambda msg: is_admin(msg.from_user.id))
+@router.message(Command("addlisting"), is_admin_interface)
 async def cmd_add_listing(message: Message, state: FSMContext):
     user_id = await get_or_create_user(message)
     session_id = ingest_service.create_session(user_id, "SINGLE")
@@ -376,7 +408,7 @@ async def cmd_cancel_draft(message: Message, state: FSMContext):
     await message.answer("Draft review closed. The draft remains pending in /viewdrafts.")
     await state.clear()
 
-@router.message(Command("bulkadd"), lambda msg: is_admin(msg.from_user.id))
+@router.message(Command("bulkadd"), is_admin_interface)
 async def cmd_bulk_add(message: Message, state: FSMContext):
     user_id = await get_or_create_user(message)
     session_id = ingest_service.create_session(user_id, "BULK")
@@ -402,7 +434,7 @@ async def cmd_done_bulk(message: Message, state: FSMContext):
 
 from app.qualification.service import QualificationService
 
-@router.message(Command("sim_reply"), lambda msg: is_admin(msg.from_user.id))
+@router.message(Command("sim_reply"), is_admin_interface)
 async def cmd_sim_reply(message: Message):
         
     parts = message.text.split(maxsplit=2)
@@ -422,7 +454,7 @@ async def cmd_sim_reply(message: Message):
         await message.answer(f"Error processing reply: {e}")
 
 
-@router.callback_query(F.data.startswith("review_draft_"), lambda call: is_admin(call.from_user.id))
+@router.callback_query(F.data.startswith("review_draft_"), is_admin_callback_interface)
 async def process_review_draft_callback(callback: CallbackQuery, state: FSMContext):
     if callback.message is None:
         await callback.answer("This draft cannot be opened from this message.", show_alert=True)
@@ -435,7 +467,7 @@ async def process_review_draft_callback(callback: CallbackQuery, state: FSMConte
     await callback.answer()
     await _send_draft_preview(callback.message, draft_id)
 
-@router.callback_query(F.data.startswith("approve_draft_"), lambda call: is_admin(call.from_user.id))
+@router.callback_query(F.data.startswith("approve_draft_"), is_admin_callback_interface)
 async def process_approve_draft_callback(callback: CallbackQuery):
     draft_id = callback.data.replace("approve_draft_", "")
     try:
@@ -445,7 +477,7 @@ async def process_approve_draft_callback(callback: CallbackQuery):
         await callback.answer(f"Failed to approve: {e}", show_alert=True)
     await callback.answer()
 
-@router.callback_query(F.data.startswith("reject_draft_"), lambda call: is_admin(call.from_user.id))
+@router.callback_query(F.data.startswith("reject_draft_"), is_admin_callback_interface)
 async def process_reject_draft_callback(callback: CallbackQuery):
     draft_id = callback.data.replace("reject_draft_", "")
     from app.db.client import get_supabase_client
@@ -457,7 +489,7 @@ async def process_reject_draft_callback(callback: CallbackQuery):
         await callback.answer(f"Failed to reject: {e}", show_alert=True)
     await callback.answer()
 
-@router.callback_query(F.data.startswith("deactivate_listing_"), lambda call: is_admin(call.from_user.id))
+@router.callback_query(F.data.startswith("deactivate_listing_"), is_admin_callback_interface)
 async def process_deactivate_listing_callback(callback: CallbackQuery):
     listing_id = callback.data.replace("deactivate_listing_", "")
     from app.db.client import get_supabase_client
@@ -469,6 +501,6 @@ async def process_deactivate_listing_callback(callback: CallbackQuery):
         await callback.answer(f"Failed to deactivate: {e}", show_alert=True)
     await callback.answer()
 
-@router.message(StateFilter(None), lambda msg: is_admin(msg.from_user.id))
+@router.message(StateFilter(None), is_admin_interface)
 async def admin_fallback(message: Message):
     await message.answer("I didn't quite catch that. Type /help to see a list of available commands.")
