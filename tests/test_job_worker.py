@@ -108,7 +108,11 @@ class NotificationDatabase:
                 "positive_reasons": ["Within budget"],
                 "missing_information": [],
             }],
-            "search_sessions": [{"user_id": "user-1"}],
+            "search_sessions": [{
+                "user_id": "user-1",
+                "status": "ACTIVE",
+                "version": 3,
+            }],
             "users": [{"telegram_user_id": 12345}],
             "listings": [{
                 "property_configuration": "2BHK",
@@ -116,17 +120,34 @@ class NotificationDatabase:
                 "rent": 37_000,
                 "maintenance": 3_000,
             }],
+            "visits": [{
+                "id": "visit-1",
+                "search_id": "search-1",
+                "status": "AWAITING_RENTER_CONFIRMATION",
+                "proposed_start": "2026-08-12T11:00:00+05:30",
+            }],
         }
 
     def table(self, name):
         return NotificationQuery(self.rows[name])
 
 
-@pytest.mark.asyncio
-async def test_strong_match_notification_sends_details_with_valid_match_actions(monkeypatch):
-    import aiogram
+class SequencedSearchDatabase(NotificationDatabase):
+    def __init__(self, search_states):
+        super().__init__()
+        self.search_states = list(search_states)
+        self.search_reads = 0
 
-    sent_messages = []
+    def table(self, name):
+        if name == "search_sessions":
+            index = min(self.search_reads, len(self.search_states) - 1)
+            self.search_reads += 1
+            return NotificationQuery([self.search_states[index]])
+        return super().table(name)
+
+
+def install_fake_bot(monkeypatch, sent_messages):
+    import aiogram
 
     class FakeSession:
         async def close(self):
@@ -140,11 +161,21 @@ async def test_strong_match_notification_sends_details_with_valid_match_actions(
             sent_messages.append(kwargs)
 
     monkeypatch.setattr(aiogram, "Bot", FakeBot)
+
+
+@pytest.mark.asyncio
+async def test_strong_match_notification_sends_details_with_valid_match_actions(monkeypatch):
+    sent_messages = []
+    install_fake_bot(monkeypatch, sent_messages)
     worker = JobWorker(db=NotificationDatabase(), matching_engine=FakeMatcher())
 
     await worker.process_job({
         "job_type": "SEND_RENTER_NOTIFICATION",
-        "payload": {"search_id": "search-1", "listing_id": "listing-1"},
+        "payload": {
+            "search_id": "search-1",
+            "listing_id": "listing-1",
+            "search_version": 3,
+        },
     })
 
     assert len(sent_messages) == 1
@@ -158,3 +189,68 @@ async def test_strong_match_notification_sends_details_with_valid_match_actions(
         "skip_match_a30559d3-defd-4088-b78d-109368a0caf3",
     ]
     assert all(len(value.encode("utf-8")) <= 64 for value in callback_data)
+
+
+@pytest.mark.asyncio
+async def test_match_notification_is_skipped_if_search_pauses_at_send_boundary(monkeypatch):
+    sent_messages = []
+    install_fake_bot(monkeypatch, sent_messages)
+    db = SequencedSearchDatabase([
+        {"user_id": "user-1", "status": "ACTIVE", "version": 3},
+        {"user_id": "user-1", "status": "PAUSED", "version": 4},
+    ])
+    worker = JobWorker(db=db, matching_engine=FakeMatcher())
+
+    await worker.process_job({
+        "job_type": "SEND_RENTER_NOTIFICATION",
+        "payload": {
+            "search_id": "search-1",
+            "listing_id": "listing-1",
+            "search_version": 3,
+        },
+    })
+
+    assert db.search_reads == 2
+    assert sent_messages == []
+
+
+@pytest.mark.asyncio
+async def test_match_notification_is_skipped_for_stale_search_version(monkeypatch):
+    sent_messages = []
+    install_fake_bot(monkeypatch, sent_messages)
+    db = NotificationDatabase()
+    worker = JobWorker(db=db, matching_engine=FakeMatcher())
+
+    await worker.process_job({
+        "job_type": "SEND_RENTER_NOTIFICATION",
+        "payload": {
+            "search_id": "search-1",
+            "listing_id": "listing-1",
+            "search_version": 2,
+        },
+    })
+
+    assert sent_messages == []
+
+
+@pytest.mark.asyncio
+async def test_visit_proposal_is_skipped_if_search_pauses_at_send_boundary(monkeypatch):
+    sent_messages = []
+    install_fake_bot(monkeypatch, sent_messages)
+    db = SequencedSearchDatabase([
+        {"user_id": "user-1", "status": "ACTIVE", "version": 3},
+        {"user_id": "user-1", "status": "PAUSED", "version": 4},
+    ])
+    worker = JobWorker(db=db, matching_engine=FakeMatcher())
+
+    await worker.process_job({
+        "job_type": "PROPOSE_VISIT_TO_RENTER",
+        "payload": {
+            "visit_id": "visit-1",
+            "search_id": "search-1",
+            "search_version": 3,
+        },
+    })
+
+    assert db.search_reads == 2
+    assert sent_messages == []

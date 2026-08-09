@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 import pytest
 from aiogram.types import BotCommandScopeChat, BotCommandScopeDefault
 
@@ -65,6 +67,7 @@ async def test_admin_and_renter_menu_switches_are_chat_scoped_and_track_mode():
     assert scope.chat_id == 101
     assert command_names(commands) == command_names(ADMIN_COMMANDS)
     assert "sim_reply" in command_names(commands)
+    assert "version" in command_names(commands)
     assert "renter" in command_names(commands)
     assert is_admin_menu_active(101) is True
 
@@ -150,3 +153,32 @@ async def test_admin_menu_cannot_be_exposed_to_an_entire_group_chat():
     assert bot.command_calls == []
     assert state.cleared is False
     assert "private chat" in message.answers[-1]
+
+
+@pytest.mark.asyncio
+async def test_version_reports_runtime_metadata_only_in_admin_mode(monkeypatch):
+    bot = FakeBot()
+    message = FakeMessage(bot)
+    monkeypatch.setattr(admin_handlers.settings, "admin_telegram_ids", [101])
+    monkeypatch.setattr(admin_handlers.settings, "app_build_sha", "abc123")
+    monkeypatch.setattr(admin_handlers.settings, "renter_collection_mode", "guided")
+    monkeypatch.setattr(admin_handlers.settings, "llm_provider", "groq")
+    monkeypatch.setattr(
+        admin_handlers,
+        "PROCESS_STARTED_AT",
+        datetime(2026, 8, 9, 12, 30, tzinfo=timezone.utc),
+    )
+
+    await admin_handlers.cmd_version(message)
+    assert message.answers == []
+
+    await activate_admin_menu(bot, 101)
+    await admin_handlers.cmd_version(message)
+
+    assert message.answers == [
+        "FlatHunter Runtime\n"
+        "Build SHA: abc123\n"
+        "Renter collection mode: guided\n"
+        "LLM provider: groq\n"
+        "Process started: 2026-08-09T12:30:00Z"
+    ]

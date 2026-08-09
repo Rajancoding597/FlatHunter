@@ -4,6 +4,7 @@
 class RenterState(StatesGroup):
     waiting_for_requirement = State()
     collecting_extras = State()
+    reviewing_requirements = State()
     confirming_requirement = State()
     waiting_for_availability = State()
     waiting_for_search_edit = State()

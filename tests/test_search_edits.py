@@ -1,5 +1,6 @@
 ﻿from app.requirements.schemas import RequirementEditResponse
 from uuid import UUID
+from datetime import date
 
 import pytest
 
@@ -96,6 +97,13 @@ class PlanDatabase:
                 'user_id': '22222222-2222-2222-2222-222222222222',
                 'status': 'ACTIVE',
                 'version': 1,
+                'city': 'Hyderabad',
+                'created_at': '2026-08-09T10:00:00+00:00',
+                'updated_at': '2026-08-09T10:00:00+00:00',
+                'started_at': '2026-08-09T10:00:00+00:00',
+                'last_activated_at': '2026-08-09T10:00:00+00:00',
+                'paused_at': None,
+                'closed_at': None,
             }],
             'search_requirements': [{
                 'search_id': '11111111-1111-1111-1111-111111111111',
@@ -115,6 +123,44 @@ class PlanDatabase:
 
     def table(self, name):
         return PlanQuery(self, name)
+
+    def rpc(self, name, params):
+        assert name == 'update_live_renter_search'
+        database = self
+
+        class RpcQuery:
+            def execute(self):
+                session = database.rows['search_sessions'][0]
+                if (
+                    str(session['id']) != str(params['p_search_id'])
+                    or str(session['user_id']) != str(params['p_user_id'])
+                    or session['version'] != params['p_expected_version']
+                ):
+                    raise RuntimeError('STALE_SEARCH_VERSION')
+                requirements = database.rows['search_requirements'][0]
+                for field in (
+                    'listing_types', 'preferred_locations',
+                    'acceptable_locations', 'excluded_locations',
+                    'work_location', 'target_rent', 'max_rent',
+                    'preferred_move_in_date', 'latest_move_in_date',
+                    'preferred_property_configurations', 'core_preferences',
+                    'additional_preferences', 'raw_requirement_text',
+                ):
+                    requirements[field] = params.get('p_' + field)
+                session['version'] += 1
+                database.rows['agent_jobs'].append({
+                    'idempotency_key': (
+                        f'SEARCH_UPDATED:{session["id"]}:{session["version"]}'
+                    ),
+                })
+                return Result([{
+                    'session': dict(session),
+                    'requirements': dict(requirements),
+                    'updated': True,
+                    'job_enqueued': True,
+                }])
+
+        return RpcQuery()
 
 
 def test_operation_plan_persists_once_and_rejects_stale_confirmation():
@@ -149,3 +195,34 @@ def test_operation_plan_persists_once_and_rejects_stale_confirmation():
             'add Madhapur',
             expected_version=1,
         )
+
+
+def test_live_edit_grounding_accepts_relative_move_in_phrases():
+    tomorrow = RequirementEditPlan(changes=[RequirementFieldChange(
+        field='preferred_move_in_date',
+        operation=RequirementChangeOperation.SET,
+        value='2026-08-10',
+    )])
+    first_week = RequirementEditPlan(changes=[
+        RequirementFieldChange(
+            field='preferred_move_in_date',
+            operation=RequirementChangeOperation.SET,
+            value='2026-09-01',
+        ),
+        RequirementFieldChange(
+            field='latest_move_in_date',
+            operation=RequirementChangeOperation.SET,
+            value='2026-09-07',
+        ),
+    ])
+
+    RequirementService._validate_edit_plan_grounding(
+        tomorrow,
+        'move in tomorrow',
+        now=date(2026, 8, 9),
+    )
+    RequirementService._validate_edit_plan_grounding(
+        first_week,
+        'move in during the first week next month',
+        now=date(2026, 8, 9),
+    )

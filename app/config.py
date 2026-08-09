@@ -1,8 +1,12 @@
 import json
-from typing import List
+from datetime import datetime, timezone
+from typing import List, Literal
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+PROCESS_STARTED_AT = datetime.now(timezone.utc)
 
 
 class Settings(BaseSettings):
@@ -16,6 +20,8 @@ class Settings(BaseSettings):
     vision_provider: str = "gemini"  # independently select "groq" or "gemini"
     groq_vision_model: str = "qwen/qwen3.6-27b"
     gemini_vision_model: str = "gemini-2.5-flash-lite"
+    app_build_sha: str = "dev"
+    renter_collection_mode: Literal["hybrid", "guided"] = "hybrid"
 
     flathunter_default_city: str = "Hyderabad"
     flathunter_default_timezone: str = "Asia/Kolkata"
@@ -46,6 +52,21 @@ class Settings(BaseSettings):
         if stripped.startswith("["):
             return json.loads(stripped)
         return [int(user_id.strip()) for user_id in stripped.split(",") if user_id.strip()]
+
+    @field_validator("app_build_sha", mode="before")
+    @classmethod
+    def normalize_app_build_sha(cls, value):
+        if value is None:
+            return "dev"
+        normalized = str(value).strip()
+        return normalized or "dev"
+
+    @field_validator("renter_collection_mode", mode="before")
+    @classmethod
+    def normalize_renter_collection_mode(cls, value):
+        if not isinstance(value, str):
+            return value
+        return value.strip().lower()
 
 
 settings = Settings()

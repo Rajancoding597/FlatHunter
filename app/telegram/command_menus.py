@@ -27,6 +27,7 @@ ADMIN_COMMANDS = (
     BotCommand(command="viewsearches", description="View active renter searches"),
     BotCommand(command="viewlistings", description="View listing inventory"),
     BotCommand(command="viewdrafts", description="Review and edit pending drafts"),
+    BotCommand(command="version", description="View deployed bot version"),
     BotCommand(command="sim_reply", description="Simulate an owner reply"),
     BotCommand(command="renter", description="Switch to renter controls"),
     BotCommand(command="help", description="Show admin commands"),

@@ -42,6 +42,56 @@ class JobWorker:
         response = self.db.rpc("claim_next_agent_job", {"p_worker_id": self.worker_id}).execute()
         return response.data[0] if response.data else None
 
+    def _active_search_owner(
+        self,
+        search_id: str,
+        *,
+        expected_version: Any = None,
+        notification_kind: str,
+    ) -> Optional[str]:
+        """Return the owner only while a queued renter notification is still current."""
+        result = self.db.table("search_sessions").select("user_id,status,version").eq(
+            "id", search_id
+        ).limit(1).execute()
+        if not result.data:
+            logger.info(
+                "Skipping renter notification because its search no longer exists",
+                extra={"search_id": search_id, "notification_kind": notification_kind},
+            )
+            return None
+
+        search = result.data[0]
+        if search.get("status") != "ACTIVE":
+            logger.info(
+                "Skipping renter notification because its search is not active",
+                extra={
+                    "search_id": search_id,
+                    "search_status": search.get("status"),
+                    "notification_kind": notification_kind,
+                },
+            )
+            return None
+
+        if expected_version is not None:
+            try:
+                version_matches = int(search.get("version")) == int(expected_version)
+            except (TypeError, ValueError):
+                version_matches = False
+            if not version_matches:
+                logger.info(
+                    "Skipping stale renter notification",
+                    extra={
+                        "search_id": search_id,
+                        "expected_search_version": expected_version,
+                        "current_search_version": search.get("version"),
+                        "notification_kind": notification_kind,
+                    },
+                )
+                return None
+
+        user_id = search.get("user_id")
+        return str(user_id) if user_id is not None else None
+
     async def run(self):
         logger.info("Starting background job worker", extra={"worker_id": self.worker_id})
         asyncio.create_task(self.poll_emails_loop())
@@ -191,6 +241,15 @@ class JobWorker:
         elif job_type == "SEND_RENTER_NOTIFICATION":
             search_id = payload['search_id']
             listing_id = payload['listing_id']
+            expected_version = payload.get("search_version")
+
+            owner_user_id = self._active_search_owner(
+                search_id,
+                expected_version=expected_version,
+                notification_kind=job_type,
+            )
+            if owner_user_id is None:
+                return
 
             match_res = self.db.table("matches").select(
                 "id,status,fit_score,positive_reasons,missing_information"
@@ -200,12 +259,7 @@ class JobWorker:
             match = match_res.data[0]
             match_id = str(match["id"])
             
-            # Fetch user ID from search_id
-            search_res = self.db.table("search_sessions").select("user_id").eq("id", search_id).execute()
-            if not search_res.data:
-                return
-            
-            user_res = self.db.table("users").select("telegram_user_id").eq("id", search_res.data[0]['user_id']).execute()
+            user_res = self.db.table("users").select("telegram_user_id").eq("id", owner_user_id).execute()
             if not user_res.data:
                 return
             
@@ -222,9 +276,20 @@ class JobWorker:
             # Initialize bot just for sending message
             from aiogram import Bot
             from app.config import settings
-            bot = Bot(token=settings.telegram_bot_token)
             
             keyboard = _match_action_keyboard(match_id)
+
+            # The search may have been paused, cancelled, or edited while the
+            # queued job was loading its match. Recheck at the send boundary.
+            current_owner_user_id = self._active_search_owner(
+                search_id,
+                expected_version=expected_version,
+                notification_kind=job_type,
+            )
+            if current_owner_user_id != owner_user_id:
+                return
+
+            bot = Bot(token=settings.telegram_bot_token)
             
             import asyncio
             try:
@@ -237,20 +302,31 @@ class JobWorker:
         elif job_type == "PROPOSE_VISIT_TO_RENTER":
             visit_id = payload['visit_id']
             search_id = payload['search_id']
-            
-            # Fetch user ID from search_id
-            search_res = self.db.table("search_sessions").select("user_id").eq("id", search_id).execute()
-            if not search_res.data:
+            expected_version = payload.get("search_version")
+
+            owner_user_id = self._active_search_owner(
+                search_id,
+                expected_version=expected_version,
+                notification_kind=job_type,
+            )
+            if owner_user_id is None:
                 return
-                
-            user_res = self.db.table("users").select("telegram_user_id").eq("id", search_res.data[0]['user_id']).execute()
+
+            user_res = self.db.table("users").select("telegram_user_id").eq("id", owner_user_id).execute()
             if not user_res.data:
                 return
-                
+
             telegram_user_id = user_res.data[0]['telegram_user_id']
             
             # Fetch visit details
-            visit = self.db.table("visits").select("*").eq("id", visit_id).execute().data[0]
+            visit_result = self.db.table("visits").select("*").eq("id", visit_id).eq(
+                "search_id", search_id
+            ).limit(1).execute()
+            if not visit_result.data:
+                return
+            visit = visit_result.data[0]
+            if visit.get("status") != "AWAITING_RENTER_CONFIRMATION":
+                return
             proposed_start = visit['proposed_start']
             
             message_text = f"📅 The landlord has proposed a visit time:\n{proposed_start}\n\nDoes this work for you?"
@@ -258,13 +334,22 @@ class JobWorker:
             from aiogram import Bot
             from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
             from app.config import settings
-            bot = Bot(token=settings.telegram_bot_token)
             
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="Confirm Visit", callback_data=f"visit_confirm_{visit_id}")],
                 [InlineKeyboardButton(text="Decline / Propose New Time", callback_data=f"visit_decline_{visit_id}")]
             ])
-            
+
+            current_owner_user_id = self._active_search_owner(
+                search_id,
+                expected_version=expected_version,
+                notification_kind=job_type,
+            )
+            if current_owner_user_id != owner_user_id:
+                return
+
+            bot = Bot(token=settings.telegram_bot_token)
+
             import asyncio
             try:
                 await bot.send_message(chat_id=telegram_user_id, text=message_text, reply_markup=keyboard)

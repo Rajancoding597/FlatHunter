@@ -52,6 +52,7 @@ class PendingRenterAction(BaseModel):
     search_version: Optional[int] = None
     payload: dict[str, Any] = Field(default_factory=dict)
     raw_text: Optional[str] = None
+    confirmation_message_id: Optional[int] = None
 
 
 class RenterConversationService:
@@ -168,10 +169,24 @@ class RenterConversationService:
         if has_pending_action and normalized in {'no', 'n', 'nope', 'decline', 'keep it', 'keep current', 'never mind', 'cancel that'}:
             return RenterTurnDecision(intents=[RenterIntent.DECLINE])
 
-        if normalized in {'hi', 'hello', 'hey', 'hey bot', 'good morning', 'good evening'}:
+        if normalized in {
+            'hi', 'hello', 'hey', 'hi there', 'hello there', 'hey there',
+            'hey bot', 'hello bot', 'hi flathunter', 'hello flathunter',
+            'good morning', 'good evening',
+        }:
             return RenterTurnDecision(intents=[RenterIntent.GREETING])
         if normalized in {'help', 'what can you do', 'how can you help me'}:
             return RenterTurnDecision(intents=[RenterIntent.HELP])
+
+        if normalized in {
+            'start searching', 'begin searching', 'search now', 'lets go',
+            'go live', 'thats all', 'that is all', 'thats it', 'that is it',
+            'nothing else', 'all good', 'skip', 'skip preferences',
+            'no', 'no thanks',
+        }:
+            return RenterTurnDecision(intents=[RenterIntent.START_SEARCH])
+        if 'that\'s all' in normalized or 'that\'s it' in normalized or 'dont ask anything else' in normalized or 'don\'t ask anything else' in normalized:
+            return RenterTurnDecision(intents=[RenterIntent.START_SEARCH])
 
         intents: list[RenterIntent] = []
         show_requirements = (
@@ -189,20 +204,20 @@ class RenterConversationService:
             intents.append(RenterIntent.SHOW_MATCHES)
         if 'tell me about that property' in normalized or 'property details' in normalized or 'more about the property' in normalized:
             intents.append(RenterIntent.PROPERTY_DETAILS)
-        if re.search(r'\b(cancel|close|stop)\b.*\b(search|hunting)\b', normalized):
+        if re.search(r'\b(cancel|close|stop|discard)\b.*\b(search|hunting|setup|requirements?)\b', normalized):
             intents.append(RenterIntent.CANCEL_SEARCH)
         if re.search(r'\bpause\b.*\b(search|alerts|notifications)?\b', normalized):
             intents.append(RenterIntent.PAUSE_SEARCH)
         if re.search(r'\b(resume|unpause|continue)\b.*\b(search|alerts|notifications)?\b', normalized):
             intents.append(RenterIntent.RESUME_SEARCH)
-        if normalized in {'start searching', 'begin searching', 'search now', 'lets go', 'go live'}:
-            intents.append(RenterIntent.START_SEARCH)
         if 'availability' in normalized or re.search(r'\b(free|available)\b.*\b(visit|viewing|weekend|weekday)', normalized):
             intents.append(RenterIntent.SET_AVAILABILITY)
 
         rental_terms = {
             'deposit', 'lease', 'brokerage', 'broker fee', 'rent agreement',
             'landlord', 'tenant', 'notice period', 'token amount', 'maintenance charge',
+            'parking', 'furnished', 'amenity', 'amenities', 'document',
+            'documents', 'police verification',
         }
         if any(term in normalized for term in rental_terms) and (
             '?' in text or normalized.startswith(('what', 'why', 'how', 'do ', 'does ', 'is ', 'are ', 'can '))
@@ -216,15 +231,12 @@ class RenterConversationService:
             normalized,
         ))
         if edit_language and requirement_language:
-            if state_name.endswith(('waiting_for_requirement', 'collecting_extras')):
+            if state_name.endswith(('waiting_for_requirement', 'collecting_extras', 'reviewing_requirements')):
                 intents.insert(0, RenterIntent.REQUIREMENT_INPUT)
             else:
                 intents.insert(0, RenterIntent.EDIT_REQUIREMENTS)
         elif state_name.endswith('waiting_for_search_edit') and not intents:
             intents.append(RenterIntent.EDIT_REQUIREMENTS)
-        elif state_name.endswith(('waiting_for_requirement', 'collecting_extras')) and not intents:
-            intents.append(RenterIntent.REQUIREMENT_INPUT)
-
         if not intents:
             return None
         return RenterTurnDecision(

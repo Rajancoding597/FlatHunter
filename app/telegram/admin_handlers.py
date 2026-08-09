@@ -7,7 +7,7 @@ from aiogram.filters import Command, StateFilter
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.utils.chat_action import ChatActionSender
-from app.config import settings
+from app.config import PROCESS_STARTED_AT, settings
 from app.telegram.states import AdminState
 from app.ingestion.service import DraftApprovalError, IngestionService
 from app.telegram.renter_handlers import get_or_create_user
@@ -205,6 +205,7 @@ async def cmd_help(message: Message):
         "/viewsearches - View active renters' searches\n"
         "/viewlistings - View recent active listings\n"
         "/viewdrafts - Review, edit, approve, or reject pending drafts\n"
+        "/version - View deployed bot version and runtime mode\n"
         "/sim_reply - Simulate an owner SMS reply\n"
         "/renter - Switch back to renter controls\n"
         "/help - Show this message"
@@ -228,6 +229,23 @@ async def cmd_status(message: Message):
         f"🔍 Active Renters: {renters.count}"
     )
     await message.answer(msg, parse_mode="HTML")
+
+
+@router.message(Command("version"), is_admin_interface)
+async def cmd_version(message: Message):
+    """Report non-sensitive deployment metadata in explicit admin mode only."""
+    if not is_admin_interface(message):
+        return
+
+    started_at = PROCESS_STARTED_AT.isoformat().replace("+00:00", "Z")
+    await message.answer(
+        "FlatHunter Runtime\n"
+        f"Build SHA: {settings.app_build_sha}\n"
+        f"Renter collection mode: {settings.renter_collection_mode}\n"
+        f"LLM provider: {settings.llm_provider}\n"
+        f"Process started: {started_at}",
+        parse_mode=None,
+    )
 
 @router.message(Command("viewsearches"), is_admin_interface)
 async def cmd_view_searches(message: Message):

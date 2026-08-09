@@ -6,13 +6,14 @@ from typing import Any
 
 CORE_LABELS = {
     'listing type': 'property or room type',
+    'home configuration': 'home configuration',
     'location': 'preferred location',
     'maximum budget': 'maximum monthly budget',
     'move-in timing': 'move-in timing',
 }
 
 FIELD_LABELS = {
-    'listing_types': 'Listing type',
+    'listing_types': 'Rental arrangement',
     'preferred_locations': 'Preferred locations',
     'acceptable_locations': 'Also acceptable',
     'excluded_locations': 'Excluded locations',
@@ -25,6 +26,20 @@ FIELD_LABELS = {
     'core_preferences': 'Preferences',
     'additional_preferences': 'Other preferences',
 }
+
+CONFIGURATION_ANSWERED_MARKER = '__flathunter_configuration_answered'
+
+
+def _configuration_answered(values: dict) -> bool:
+    additional = values.get('additional_preferences') or {}
+    marker = (
+        additional.get(CONFIGURATION_ANSWERED_MARKER)
+        if isinstance(additional, dict)
+        else None
+    )
+    return bool(values.get('configuration_answered')) or bool(
+        values.get('preferred_property_configurations')
+    ) or str(marker or '').casefold() == 'true'
 
 
 def as_requirement_dict(requirements: Any) -> dict:
@@ -40,6 +55,11 @@ def missing_core_fields(requirements: Any) -> list[str]:
     missing = []
     if not values.get('listing_types'):
         missing.append('listing type')
+    if (
+        'ENTIRE_PROPERTY' in (values.get('listing_types') or [])
+        and not _configuration_answered(values)
+    ):
+        missing.append('home configuration')
     if not (values.get('preferred_locations') or values.get('acceptable_locations')):
         missing.append('location')
     if not values.get('max_rent'):
@@ -55,6 +75,7 @@ def next_requirement_question(requirements: Any) -> str:
         return 'Anything else you would like me to consider, or should I start searching?'
     questions = {
         'listing type': 'Are you looking for an entire flat, a private room, or a shared room?',
+        'home configuration': 'Which home configurations work for you, such as 1BHK, 2BHK, or Any?',
         'location': 'Which Hyderabad areas would you prefer?',
         'maximum budget': 'What is the maximum monthly rent you are comfortable with?',
         'move-in timing': 'When would you like to move in?',
@@ -62,12 +83,29 @@ def next_requirement_question(requirements: Any) -> str:
     return questions[missing[0]]
 
 
-def format_requirements(requirements: Any, *, title: str = 'What I have so far') -> str:
+def format_requirements(
+    requirements: Any,
+    *,
+    title: str = 'What I have so far',
+    pending_change: Any = None,
+) -> str:
     values = as_requirement_dict(requirements)
     lines = [f'<b>{escape(title)}</b>']
     visible = False
     for field in FIELD_LABELS:
         value = values.get(field)
+        if field == 'additional_preferences' and isinstance(value, dict):
+            value = {
+                key: item
+                for key, item in value.items()
+                if not str(key).startswith('__flathunter_')
+            }
+        if (
+            field == 'preferred_property_configurations'
+            and _configuration_answered(values)
+            and not value
+        ):
+            value = ['Any']
         if value in (None, '', [], {}):
             continue
         visible = True
@@ -81,6 +119,16 @@ def format_requirements(requirements: Any, *, title: str = 'What I have so far')
         lines.extend(['', f'<b>Still needed:</b> {escape(missing_text)}'])
     else:
         lines.extend(['', '<b>Core requirements:</b> complete'])
+    if pending_change:
+        pending = as_requirement_dict(pending_change)
+        field = str(pending.get('field') or '').split('.')[-1]
+        label = FIELD_LABELS.get(field, field.replace('_', ' ').title())
+        lines.extend([
+            '',
+            '<b>Pending confirmation</b>',
+            f'<b>{escape(label)} ? current:</b> {escape(_plain_pending_value(pending.get("current_value")))}',
+            f'<b>{escape(label)} ? proposed:</b> {escape(_plain_pending_value(pending.get("proposed_value")))}',
+        ])
     return '\n'.join(lines)
 
 
@@ -110,6 +158,8 @@ def _format_value(field: str, value: Any) -> str:
     if field in {'core_preferences', 'additional_preferences'} and isinstance(value, dict):
         items = []
         for key, detail in value.items():
+            if str(key).startswith('__flathunter_'):
+                continue
             if isinstance(detail, dict):
                 raw = detail.get('value')
                 importance = str(detail.get('importance') or '').split('.')[-1]
@@ -130,3 +180,17 @@ def _humanize(value: Any) -> str:
     if value is None:
         return 'not set'
     return str(value).replace('_', ' ').strip().title()
+
+
+def _plain_pending_value(value: Any) -> str:
+    if value in (None, '', [], {}):
+        return 'Not set'
+    if isinstance(value, dict):
+        return ', '.join(
+            f'{_humanize(key)}: {_humanize(item)}'
+            for key, item in value.items()
+            if item not in (None, '', [], {})
+        ) or 'Not set'
+    if isinstance(value, list):
+        return ', '.join(_humanize(item) for item in value)
+    return _humanize(value)
