@@ -8,28 +8,437 @@ from app.telegram.states import RenterState
 from app.requirements.service import RequirementService
 from app.db.client import get_supabase_client
 from app.common.tracer import tracer
-from uuid import uuid4
+from uuid import UUID
 from datetime import datetime, timezone
+from html import escape
+import logging
+from typing import Optional
+
+from app.requirements.presentation import (
+    format_requirement_diff,
+    format_requirements,
+    missing_core_fields,
+)
+from app.requirements.schemas import RequirementEditPlan
+from app.telegram.command_menus import is_admin_menu_active
+from app.telegram.renter_conversation import (
+    PendingRenterAction,
+    RenterConversationService,
+    RenterIntent,
+)
 
 router = Router()
 req_service = RequirementService()
+conversation_service = RenterConversationService()
+logger = logging.getLogger(__name__)
 
 # Words that signal "I'm done, start searching"
 DONE_PHRASES = {"no", "nope", "nothing", "that's it", "thats it", "start searching",
                 "go ahead", "begin", "nah", "all good", "nothing else",
                 "no thanks", "search", "lets go", "let's go", "begin searching"}
 
-async def get_or_create_user(message: Message) -> str:
+CONFIRM_ACTION_CALLBACK = 'renter:confirm'
+DECLINE_ACTION_CALLBACK = 'renter:keep'
+
+
+def _confirmation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text='Confirm', callback_data=CONFIRM_ACTION_CALLBACK),
+        InlineKeyboardButton(text='Keep current', callback_data=DECLINE_ACTION_CALLBACK),
+    ]])
+
+
+async def _current_requirements(message: Message, state: FSMContext, telegram_user=None) -> tuple[dict, Optional[dict]]:
+    data = await state.get_data()
+    parsed = data.get('parsed_reqs')
+    if parsed:
+        return dict(parsed), None
+    try:
+        user_id = await get_or_create_user(message, telegram_user)
+        session, requirements = req_service.get_editable_search(user_id)
+        return requirements, session
+    except ValueError:
+        return {}, None
+
+
+async def _classify_renter_turn(message: Message, state: FSMContext):
+    data = await state.get_data()
+    requirements, _ = await _current_requirements(message, state)
+    return await conversation_service.classify(
+        message.text or '',
+        current_state=await state.get_state(),
+        requirements=requirements,
+        missing_fields=missing_core_fields(requirements),
+        pending_action=data.get('pending_action'),
+        recent_history=data.get('recent_turns') or [],
+    )
+
+
+async def _remember_turn(state: FSMContext, role: str, text: str) -> None:
+    data = await state.get_data()
+    history = list(data.get('recent_turns') or [])
+    history.append({'role': role, 'text': text[:1000]})
+    await state.update_data(recent_turns=history[-conversation_service.MAX_HISTORY_TURNS :])
+
+
+async def _resume_flow(message: Message, state: FSMContext, requirements: Optional[dict] = None) -> None:
+    prompt = conversation_service.resume_prompt(await state.get_state(), requirements)
+    if prompt:
+        await message.answer(prompt)
+
+
+async def _show_current_requirements(message: Message, state: FSMContext, *, resume: bool = True) -> None:
+    requirements, _ = await _current_requirements(message, state)
+    await message.answer(format_requirements(requirements))
+    if resume:
+        await _resume_flow(message, state, requirements)
+
+
+async def _set_pending_action(
+    message: Message,
+    state: FSMContext,
+    pending: PendingRenterAction,
+    prompt: str,
+) -> None:
+    await state.update_data(pending_action=pending.model_dump(mode='json'))
+    await state.set_state(RenterState.confirming_conversational_action)
+    await message.answer(prompt, reply_markup=_confirmation_keyboard())
+
+
+async def _request_cancel_confirmation(message: Message, state: FSMContext) -> None:
+    user_id = await get_or_create_user(message)
+    try:
+        session, _ = req_service.get_editable_search(user_id)
+    except ValueError:
+        await message.answer('You do not have an active or paused search to cancel.')
+        return
+    pending = PendingRenterAction(
+        action='cancel_search',
+        return_state=await state.get_state(),
+        search_id=str(session.get('id')),
+        search_version=int(session.get('version') or 1),
+    )
+    await _set_pending_action(
+        message,
+        state,
+        pending,
+        'Canceling stops all matching and alerts for this search. Do you want to cancel it?',
+    )
+
+
+async def _handle_search_edit(
+    message: Message,
+    state: FSMContext,
+    text: str,
+    *,
+    show_after: bool = False,
+) -> None:
+    user_id = await get_or_create_user(message)
+    try:
+        session, current = req_service.get_editable_search(user_id)
+        async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
+            plan = await req_service.parse_search_edit_plan(text, current)
+        if not plan.changes:
+            await message.answer('I could not identify a specific change. For example, say add Madhapur or set my maximum rent to 25k.')
+            return
+        proposed = req_service.apply_edit_plan(current, plan)
+        if all(current.get(field) == proposed.get(field) for field in req_service.EDITABLE_FIELDS):
+            await message.answer('That is already part of your saved search, so I left it unchanged.')
+            if show_after:
+                await message.answer(format_requirements(current, title='Your current requirements'))
+            return
+        missing = missing_core_fields(proposed)
+        if missing:
+            missing_text = ', '.join(missing)
+            await message.answer(f'I cannot leave an active search without {escape(missing_text)}. Please give me a replacement value instead.')
+            return
+        if req_service.edit_plan_is_risky(current, plan):
+            pending = PendingRenterAction(
+                action='edit_search',
+                return_state=await state.get_state(),
+                search_id=str(session.get('id')),
+                search_version=int(session.get('version') or 1),
+                payload={'plan': plan.model_dump(mode='json'), 'show_after': show_after},
+                raw_text=text,
+            )
+            confirmation_text = format_requirement_diff(current, proposed) + '\n\nDo you want me to save these changes?'
+            await _set_pending_action(message, state, pending, confirmation_text)
+            return
+        version, updated = req_service.update_live_search_from_plan(
+            user_id,
+            UUID(str(session.get('id'))),
+            plan,
+            text,
+            expected_version=int(session.get('version') or 1),
+        )
+    except (ValueError, RuntimeError) as error:
+        await message.answer(escape(str(error)))
+        return
+    await message.answer(f'Saved that update. I am checking the inventory again using search version {version}.')
+    if show_after:
+        await message.answer(format_requirements(updated, title='Your updated requirements'))
+    await state.clear()
+
+
+async def _confirm_pending_action(message: Message, state: FSMContext, telegram_user=None) -> None:
+    data = await state.get_data()
+    raw_pending = data.get('pending_action')
+    if not raw_pending:
+        await message.answer('That confirmation has expired. Please send the request again.')
+        await state.clear()
+        return
+    pending = PendingRenterAction(**raw_pending)
+    user_id = await get_or_create_user(message, telegram_user)
+    actor = telegram_user or message.from_user
+    try:
+        if pending.action == 'cancel_search':
+            result = get_supabase_client().table('search_sessions').update({'status': 'CLOSED'}).eq('id', pending.search_id).eq('user_id', user_id).eq('version', pending.search_version).execute()
+            if not result.data:
+                raise RuntimeError('Your search changed elsewhere; please review it before canceling.')
+            await message.answer('Your search is canceled. You will not receive further alerts for it.')
+            tracer.log_event('SEARCH_CANCELLED', override_telegram_user_id=actor.id, payload={'search_id': pending.search_id})
+            await state.clear()
+            return
+        if pending.action == 'replace_search':
+            result = get_supabase_client().table('search_sessions').update({'status': 'CLOSED'}).eq('id', pending.search_id).eq('user_id', user_id).eq('version', pending.search_version).execute()
+            if not result.data:
+                raise RuntimeError('Your current search changed. Please use /start again.')
+            await state.set_state(RenterState.waiting_for_requirement)
+            await state.update_data(chat_history=[], parsed_reqs={}, pending_action=None, recent_turns=[])
+            await message.answer('Your previous search is canceled. Tell me what you want in the new search.')
+            return
+        if pending.action == 'edit_search':
+            plan = RequirementEditPlan(**pending.payload.get('plan', {}))
+            version, updated = req_service.update_live_search_from_plan(
+                user_id,
+                UUID(str(pending.search_id)),
+                plan,
+                pending.raw_text or '',
+                expected_version=pending.search_version,
+            )
+            await message.answer(f'Confirmed and saved. I am rematching your search using version {version}.')
+            if pending.payload.get('show_after'):
+                await message.answer(format_requirements(updated, title='Your updated requirements'))
+            await state.clear()
+            return
+    except (ValueError, RuntimeError) as error:
+        await message.answer(escape(str(error)))
+        await state.clear()
+        return
+    await message.answer('That action is no longer available. Please send the request again.')
+    await state.clear()
+
+
+async def _decline_pending_action(message: Message, state: FSMContext, telegram_user=None) -> None:
+    data = await state.get_data()
+    raw_pending = data.get('pending_action')
+    if not raw_pending:
+        await message.answer('There is no pending change to keep or decline.')
+        await state.clear()
+        return
+    pending = PendingRenterAction(**raw_pending)
+    await state.update_data(pending_action=None)
+    await state.set_state(pending.return_state)
+    await message.answer('Kept your current search unchanged.')
+    requirements, _ = await _current_requirements(message, state, telegram_user)
+    await _resume_flow(message, state, requirements)
+
+
+async def _activate_draft_from_state(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    search_id = data.get('search_id')
+    user_id = data.get('user_id') or await get_or_create_user(message)
+    if not search_id:
+        await message.answer('Your draft is not ready yet. Tell me your requirements first.')
+        return
+    try:
+        session = req_service.activate_search(user_id, search_id)
+    except ValueError as error:
+        await message.answer(f'I still need more information before starting: {escape(str(error))}')
+        return
+    await message.answer('Your search is live. I will message you when I find matching properties.')
+    tracer.log_event('SEARCH_STARTED', override_telegram_user_id=message.from_user.id, payload={'search_id': str(session.id)}, override_search_id=str(session.id))
+    await state.clear()
+
+
+async def _show_matches(message: Message) -> None:
+    user_id = await get_or_create_user(message)
+    try:
+        session, _ = req_service.get_editable_search(user_id)
+    except ValueError:
+        await message.answer('You do not have an active or paused search with matches yet.')
+        return
     db = get_supabase_client()
-    tg_id = message.from_user.id
+    result = db.table('matches').select('*').eq('search_id', session.get('id')).order('fit_score', desc=True).limit(10).execute()
+    matches = [item for item in (result.data or []) if item.get('status') != 'SKIPPED']
+    matches.sort(key=lambda item: float(item.get('fit_score') or 0), reverse=True)
+    matches = matches[:5]
+    if not matches:
+        await message.answer('I have not found a reviewable match yet. I am still checking new listings.')
+        return
+    from app.jobs.worker import JobWorker, _match_action_keyboard
+    result_suffix = 's' if len(matches) != 1 else ''
+    await message.answer(f'I found {len(matches)} result{result_suffix} to review.')
+    for rank, match in enumerate(matches, start=1):
+        listing_result = db.table('listings').select('*').eq('id', match.get('listing_id')).execute()
+        if not listing_result.data:
+            continue
+        listing = listing_result.data[0]
+        card = JobWorker.build_match_card(rank, match, listing)
+        await message.answer(card, reply_markup=_match_action_keyboard(str(match.get('id'))))
+
+
+async def _show_referenced_property(message: Message) -> None:
+    user_id = await get_or_create_user(message)
+    try:
+        session, _ = req_service.get_editable_search(user_id)
+    except ValueError:
+        await message.answer('You do not have a current search result to describe.')
+        return
+    db = get_supabase_client()
+    result = db.table('matches').select('*').eq('search_id', session.get('id')).order('fit_score', desc=True).limit(10).execute()
+    matches = [item for item in (result.data or []) if item.get('status') != 'SKIPPED']
+    if not matches:
+        await message.answer('There is no current property match to describe yet.')
+        return
+    if len(matches) > 1:
+        rows = [[InlineKeyboardButton(text=f'Property {index}', callback_data='details_match_' + str(item.get('id')))]
+                for index, item in enumerate(matches[:5], start=1)]
+        await message.answer('Which property do you mean?', reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        return
+    match = matches[0]
+    listing_result = db.table('listings').select('*').eq('id', match.get('listing_id')).execute()
+    if not listing_result.data:
+        await message.answer('That property is no longer available to review.')
+        return
+    from app.matching.details import clarification_labels, draft_property_narrative
+    narrative = await draft_property_narrative(listing_result.data[0])
+    clarifications = clarification_labels(match.get('missing_information'))
+    suffix = ''
+    if clarifications:
+        suffix = '\n\nStill being confirmed with the owner: ' + ', '.join(clarifications) + '.'
+    await message.answer(narrative + suffix, parse_mode=None)
+
+
+async def _handle_conversational_decision(message: Message, state: FSMContext, decision) -> bool:
+    '''Execute classified intents except requirement collection input.'''
+    if is_admin_menu_active(message.chat.id):
+        return True
+    intents = list(decision.intents)
+    lifecycle = {RenterIntent.PAUSE_SEARCH, RenterIntent.RESUME_SEARCH, RenterIntent.CANCEL_SEARCH}
+    if len(lifecycle.intersection(intents)) > 1:
+        await message.answer('Those search actions conflict. Should I pause, resume, or cancel the search?')
+        return True
+
+    handled = False
+    resume_after = False
+    skip_show = False
+    for intent in intents:
+        if intent == RenterIntent.REQUIREMENT_INPUT:
+            continue
+        if intent == RenterIntent.EDIT_REQUIREMENTS:
+            await _handle_search_edit(
+                message,
+                state,
+                decision.requirement_or_edit_text or message.text or '',
+                show_after=RenterIntent.SHOW_REQUIREMENTS in intents,
+            )
+            handled = True
+            skip_show = True
+        elif intent == RenterIntent.SHOW_REQUIREMENTS and not skip_show:
+            await _show_current_requirements(message, state, resume=False)
+            handled = True
+            resume_after = True
+        elif intent == RenterIntent.SHOW_STATUS:
+            await cmd_mysearch(message)
+            handled = True
+            resume_after = True
+        elif intent == RenterIntent.SHOW_MATCHES:
+            await _show_matches(message)
+            handled = True
+            resume_after = True
+        elif intent == RenterIntent.PROPERTY_DETAILS:
+            await _show_referenced_property(message)
+            handled = True
+            resume_after = True
+        elif intent == RenterIntent.PAUSE_SEARCH:
+            await cmd_pause_search(message)
+            handled = True
+            resume_after = True
+        elif intent == RenterIntent.RESUME_SEARCH:
+            await cmd_resume_search(message)
+            handled = True
+            resume_after = True
+        elif intent == RenterIntent.CANCEL_SEARCH:
+            await _request_cancel_confirmation(message, state)
+            handled = True
+        elif intent == RenterIntent.START_SEARCH:
+            await _activate_draft_from_state(message, state)
+            handled = True
+        elif intent == RenterIntent.SET_AVAILABILITY:
+            normalized = (message.text or '').casefold().strip()
+            if normalized in {'set availability', 'update availability', 'change availability'}:
+                await cmd_set_availability(message, state)
+            else:
+                from app.scheduling.service import SchedulingService
+                try:
+                    user_id = await get_or_create_user(message)
+                    await SchedulingService().parse_and_save_availability(user_id, None, message.text or '')
+                    await message.answer('Saved your visit availability.')
+                    await state.clear()
+                except Exception:
+                    logger.exception('Could not save renter availability')
+                    await message.answer('I could not save that availability. Try something like weekends anytime or weekdays after 6 PM.')
+            handled = True
+        elif intent == RenterIntent.RENTAL_QUESTION:
+            answer = await conversation_service.answer_rental_question(decision.rental_question or message.text or '')
+            await message.answer(answer, parse_mode=None)
+            handled = True
+            resume_after = True
+        elif intent == RenterIntent.CONFIRM:
+            await _confirm_pending_action(message, state)
+            handled = True
+        elif intent == RenterIntent.DECLINE:
+            await _decline_pending_action(message, state)
+            handled = True
+        elif intent == RenterIntent.GREETING:
+            current_state = await state.get_state()
+            if current_state:
+                await message.answer('Hi! I still have your progress, so we can continue where we left off.')
+                resume_after = True
+            else:
+                await cmd_start(message, state)
+            handled = True
+        elif intent == RenterIntent.HELP:
+            await cmd_help(message, state)
+            handled = True
+        elif intent == RenterIntent.OUT_OF_SCOPE:
+            await message.answer('I can help with your flat search, saved requirements, matches, visits, and general rental questions. I cannot handle that unrelated request.')
+            handled = True
+            resume_after = True
+        elif intent == RenterIntent.AMBIGUOUS:
+            clarification = decision.clarification_question or 'I am not sure whether you want to change your search, view it, or ask a rental question. Could you clarify?'
+            await message.answer(clarification[:1000], parse_mode=None)
+            handled = True
+
+    if resume_after and await state.get_state() != RenterState.confirming_conversational_action.state:
+        requirements, _ = await _current_requirements(message, state)
+        await _resume_flow(message, state, requirements)
+    return handled
+
+
+async def get_or_create_user(message: Message, telegram_user=None) -> str:
+    db = get_supabase_client()
+    identity = telegram_user or message.from_user
+    tg_id = identity.id
     res = db.table("users").select("*").eq("telegram_user_id", tg_id).execute()
     if res.data:
         return res.data[0]['id']
     
     new_user = db.table("users").insert({
         "telegram_user_id": tg_id,
-        "telegram_username": message.from_user.username,
-        "display_name": message.from_user.full_name,
+        "telegram_username": identity.username,
+        "display_name": identity.full_name,
         "role": "RENTER"
     }).execute()
     return new_user.data[0]['id']
@@ -45,13 +454,25 @@ async def check_and_handle_active_searches(message: Message, state: FSMContext) 
     
     from app.config import settings
     if active_count >= settings.max_active_searches:
-        await message.answer(
-            f"⚠️ You currently have an active search running!\n\n"
-            f"In this early version, we only support {settings.max_active_searches} active search(es) at a time. "
-            "Would you like to cancel your current search and start a new one? (Yes/No)"
+        current_result = db.table('search_sessions').select('id,version').eq('id', res.data[0].get('id')).eq('user_id', user_id).execute()
+        current = current_result.data[0]
+        pending = PendingRenterAction(
+            action='replace_search',
+            return_state=await state.get_state(),
+            search_id=str(current.get('id')),
+            search_version=int(current.get('version') or 1),
         )
-        await state.set_state(RenterState.confirming_new_search_override)
-        tracer.log_event("SEARCH_LIMIT_HIT", message.from_user.id, {"active_count": active_count, "limit": settings.max_active_searches})
+        await _set_pending_action(
+            message,
+            state,
+            pending,
+            'You already have an active search. Starting over will cancel it. Do you want to replace it?',
+        )
+        tracer.log_event(
+            'SEARCH_LIMIT_HIT',
+            override_telegram_user_id=message.from_user.id,
+            payload={'active_count': active_count, 'limit': settings.max_active_searches},
+        )
         return True
     
     return False
@@ -74,20 +495,7 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @router.message(Command("cancel_search"))
 async def cmd_cancel_search(message: Message, state: FSMContext):
-    user_id = await get_or_create_user(message)
-    db = get_supabase_client()
-    
-    # Close active searches
-    res = db.table("search_sessions").update({"status": "CLOSED"}).eq("user_id", user_id).eq("status", "ACTIVE").execute()
-    
-    if res.data:
-        count = len(res.data)
-        tracer.log_event("SEARCH_CANCELLED", message.from_user.id, {"count": count})
-        await message.answer(f"✅ Your active search has been cancelled. You won't receive any more alerts for it.")
-    else:
-        await message.answer("You don't have any active searches right now!")
-        
-    await state.clear()
+    await _request_cancel_confirmation(message, state)
 
 @router.message(Command("pause"))
 async def cmd_pause_search(message: Message):
@@ -182,12 +590,12 @@ async def cmd_mysearch(message: Message):
     user_id = user_res.data[0]['id']
     
     # 2. Get active search sessions
-    session_res = db.table("search_sessions").select("id, status, created_at").eq("user_id", user_id).order("created_at", desc=True).limit(1).execute()
-    if not session_res.data:
+    session_res = db.table('search_sessions').select('id,status,created_at').eq('user_id', user_id).in_('status', ['ACTIVE', 'PAUSED', 'DRAFT']).order('created_at', desc=True).limit(1).execute()
+    search_session = session_res.data[0] if session_res.data else None
+    if not search_session:
         await message.answer("You don't have any active searches right now. Say <b>hi</b> or tap /start to start a search!", parse_mode="HTML")
         return
-        
-    search_session = session_res.data[0]
+
     search_id = search_session['id']
     
     # 3. Get requirements
@@ -200,32 +608,14 @@ async def cmd_mysearch(message: Message):
     strong_matches = len([m for m in matches_res.data if m.get("status") == "STRONG_MATCH"])
     qualifying_matches = len([m for m in matches_res.data if m.get("status") == "NEEDS_QUALIFICATION"])
     
-    locations = ", ".join(req.get("preferred_locations", [])) or "Anywhere in Hyderabad"
-    
-    types_list = req.get("listing_types") or []
-    config_list = req.get("preferred_property_configurations") or []
-    combined_types = [t for t in types_list + config_list if t]
-    types = ", ".join(combined_types) if combined_types else "Any"
-    
-    budget = f"Up to ₹{req.get('max_rent'):,}" if req.get("max_rent") and req.get("max_rent") < 999999 else "Not specified"
-    
-    prefs = req.get("core_preferences", {})
-    prefs_str = ", ".join([f"{k} (Required)" if isinstance(v, dict) and v.get("importance") == "REQUIRED" else k for k, v in prefs.items()]) if prefs else "None"
-    
-    status_icon = "🟢 ACTIVE" if search_session.get("status") == "ACTIVE" else f"⚪ {search_session.get('status')}"
-    
+    status = escape(str(search_session.get('status') or 'UNKNOWN'))
     summary = (
-        f"<b>📋 Your Rental Search Status</b>\n\n"
-        f"<b>Status:</b> {status_icon}\n"
-        f"<b>Locations:</b> {locations}\n"
-        f"<b>Property Type:</b> {types}\n"
-        f"<b>Budget:</b> {budget}\n"
-        f"<b>Preferences:</b> {prefs_str}\n\n"
-        f"<b>📊 Progress:</b>\n"
-        f"• 🎯 Direct Strong Matches: <b>{strong_matches}</b>\n"
-        f"• ⏳ Properties In Qualification: <b>{qualifying_matches}</b>\n\n"
-        f"<i>I'm continuously scanning new listings. I will message you the moment a flat matches your criteria!</i>\n\n"
-        f"Want to update your search? Use /editsearch."
+        format_requirements(req, title='Your rental search')
+        + f'\n\n<b>Status:</b> {status}'
+        + f'\n<b>Matches:</b> {total_matches}'
+        + f'\n<b>Strong matches:</b> {strong_matches}'
+        + f'\n<b>Being clarified:</b> {qualifying_matches}'
+        + '\n\nYou can tell me naturally what to change, or use /editsearch.'
     )
     await message.answer(summary, parse_mode="HTML")
 
@@ -233,12 +623,13 @@ async def cmd_mysearch(message: Message):
 async def cmd_edit_search(message: Message, state: FSMContext):
     user_id = await get_or_create_user(message)
     try:
-        req_service.get_editable_search(user_id)
+        _, current = req_service.get_editable_search(user_id)
     except ValueError as error:
         await message.answer(str(error))
         return
     await message.answer(
-        "Tell me what you want to change, for example: ‘increase my budget to 25k and include Madhapur’."
+        format_requirements(current, title='Your current requirements')
+        + '\n\nTell me what you want to change. For example: increase my budget to 25k and include Madhapur.'
     )
     await state.set_state(RenterState.waiting_for_search_edit)
 
@@ -246,27 +637,17 @@ async def cmd_edit_search(message: Message, state: FSMContext):
 @router.message(RenterState.waiting_for_search_edit)
 async def process_search_edit(message: Message, state: FSMContext):
     if not message.text or not message.text.strip():
-        await message.answer("Please send the change as text, for example: ‘budget up to 25k’.")
+        await message.answer('Please send the change as text, for example: budget up to 25k.')
         return
-    user_id = await get_or_create_user(message)
-    try:
-        session, current = req_service.get_editable_search(user_id)
-        async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
-            patch = await req_service.parse_search_edit(message.text, current)
-        if not patch.model_dump(exclude_none=True, exclude={"conversational_summary"}):
-            await message.answer("I could not identify a change. Please be specific, such as ‘include Madhapur’ or ‘maximum rent 25k’.")
-            return
-        version = req_service.update_live_search(user_id, session["id"], patch, message.text)
-    except ValueError as error:
-        await message.answer(str(error))
+    decision = await _classify_renter_turn(message, state)
+    if RenterIntent.EDIT_REQUIREMENTS in decision.intents:
+        await _handle_conversational_decision(message, state, decision)
         return
-    except RuntimeError as error:
-        await message.answer(str(error))
+    if await _handle_conversational_decision(message, state, decision):
         return
+    await message.answer('What part of your saved search would you like to change?')
 
-    summary = patch.conversational_summary or "Updated your search"
-    await message.answer(f"{summary}. I am checking the inventory again (search version {version}).")
-    await state.clear()
+
 @router.message(Command("set_availability"))
 async def cmd_set_availability(message: Message, state: FSMContext):
     await message.answer("When are you generally free to visit properties? (e.g., 'Weekends anytime, weekdays after 6 PM')")
@@ -276,6 +657,10 @@ async def cmd_set_availability(message: Message, state: FSMContext):
 
 @router.message(F.text.lower().in_({"hi", "hello", "hey", "get started", "hey bot"}))
 async def greeting_start(message: Message, state: FSMContext):
+    if await state.get_state():
+        decision = await _classify_renter_turn(message, state)
+        await _handle_conversational_decision(message, state, decision)
+        return
     if await check_and_handle_active_searches(message, state):
         return
         
@@ -290,28 +675,48 @@ async def greeting_start(message: Message, state: FSMContext):
 
 # ─── FSM STATE HANDLERS ───
 
-@router.message(RenterState.confirming_new_search_override)
-async def process_new_search_override(message: Message, state: FSMContext):
-    user_text = message.text.strip().lower()
-    
-    if user_text in ["yes", "y", "yeah", "yep", "cancel", "sure", "ok", "okay"]:
-        user_id = await get_or_create_user(message)
-        db = get_supabase_client()
-        
-        # Close active searches
-        res = db.table("search_sessions").update({"status": "CLOSED"}).eq("user_id", user_id).eq("status", "ACTIVE").execute()
-        
-        tracer.log_event("SEARCH_OVERRIDDEN", message.from_user.id, {"count": len(res.data) if res.data else 0})
-        
-        await message.answer("✅ Previous search cancelled! Let's start fresh.\n\nTell me what you're looking for (area, budget, etc.):")
-        await state.set_state(RenterState.waiting_for_requirement)
-        await state.update_data(chat_history=[])
-    else:
-        await message.answer("Got it! I will keep your current search running. You can type /mysearch to check its status.")
-        await state.clear()
+@router.callback_query(F.data == CONFIRM_ACTION_CALLBACK)
+async def confirm_conversational_action_callback(callback: CallbackQuery, state: FSMContext):
+    await _confirm_pending_action(callback.message, state, callback.from_user)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@router.callback_query(F.data == DECLINE_ACTION_CALLBACK)
+async def decline_conversational_action_callback(callback: CallbackQuery, state: FSMContext):
+    await _decline_pending_action(callback.message, state, callback.from_user)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@router.message(RenterState.confirming_conversational_action)
+async def process_conversational_confirmation(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer('Please use the buttons, or reply yes or no.')
+        return
+    decision = await _classify_renter_turn(message, state)
+    if not {RenterIntent.CONFIRM, RenterIntent.DECLINE}.intersection(decision.intents):
+        await message.answer('Please confirm the pending action or tell me to keep the current search.', reply_markup=_confirmation_keyboard())
+        return
+    await _handle_conversational_decision(message, state, decision)
+
 
 @router.message(RenterState.waiting_for_requirement)
 async def process_requirement(message: Message, state: FSMContext):
+    if not message.text or not message.text.strip():
+        await message.answer('Please send your flat requirements as text. You can also ask what I have collected so far.')
+        return
+    decision = await _classify_renter_turn(message, state)
+    if RenterIntent.REQUIREMENT_INPUT not in decision.intents:
+        if await _handle_conversational_decision(message, state, decision):
+            return
+    show_after = RenterIntent.SHOW_REQUIREMENTS in decision.intents
     data = await state.get_data()
     chat_history = data.get("chat_history", [])
     
@@ -326,6 +731,10 @@ async def process_requirement(message: Message, state: FSMContext):
         
         async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
             parsed_reqs = await req_service.parse_requirements(full_conversation)
+
+        await state.update_data(parsed_reqs=parsed_reqs.model_dump(mode='json'))
+        if show_after:
+            await message.answer(format_requirements(parsed_reqs))
         
         if not parsed_reqs.is_complete or req_service.missing_core_requirements(parsed_reqs):
             bot_reply = parsed_reqs.follow_up_question or "Could you tell me a bit more about the area and budget you have in mind?"
@@ -359,41 +768,26 @@ async def process_requirement(message: Message, state: FSMContext):
         )
         await state.set_state(RenterState.collecting_extras)
         
-    except Exception as e:
-        await message.answer(f"Sorry, I had trouble understanding that. Could you try rephrasing? ({str(e)})")
+    except Exception:
+        logger.exception('Requirement collection failed')
+        await message.answer('I had trouble processing that safely. Please rephrase it, or ask me to show what I have collected so far.')
 
 @router.message(RenterState.collecting_extras)
 async def process_extras(message: Message, state: FSMContext):
+    if not message.text or not message.text.strip():
+        await message.answer('Please send an extra preference as text, or say start searching.')
+        return
+    if message.text.strip().casefold() in DONE_PHRASES:
+        await _activate_draft_from_state(message, state)
+        return
+    decision = await _classify_renter_turn(message, state)
+    if RenterIntent.REQUIREMENT_INPUT not in decision.intents:
+        if await _handle_conversational_decision(message, state, decision):
+            return
+    show_after = RenterIntent.SHOW_REQUIREMENTS in decision.intents
     data = await state.get_data()
-    user_text = message.text.strip().lower()
-    
     chat_history = data.get("chat_history", [])
     user_id = data.get("user_id")
-    
-    if user_text in DONE_PHRASES:
-        from app.requirements.schemas import RequirementExtractionResponse
-        parsed_reqs = RequirementExtractionResponse(**data["parsed_reqs"])
-        full_conversation = data.get("full_conversation", "\n".join(chat_history))
-        try:
-            session = req_service.activate_search(user_id, data["search_id"])
-        except ValueError as error:
-            await message.answer(f"I still need a little more information before starting: {error}")
-            return
-        tracer.log_event(
-            event_type="SEARCH_STARTED",
-            override_telegram_user_id=message.from_user.id,
-            payload={"search_id": str(session.id)},
-            override_search_id=str(session.id)
-        )
-        
-        await message.answer(
-            "🚀 <b>Your search is live!</b>\n\n"
-            "I'll message you right here as soon as I find a matching property. "
-            "Sit back and relax — I'm on it!",
-            parse_mode="HTML"
-        )
-        await state.clear()
-        return
     
     # Show typing immediately
     await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
@@ -404,6 +798,9 @@ async def process_extras(message: Message, state: FSMContext):
     try:
         async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
             parsed_reqs = await req_service.parse_requirements(full_conversation)
+        await state.update_data(parsed_reqs=parsed_reqs.model_dump(mode='json'))
+        if show_after:
+            await message.answer(format_requirements(parsed_reqs, title='Your updated requirements'))
         if req_service.missing_core_requirements(parsed_reqs):
             await message.answer(parsed_reqs.follow_up_question or "Please add the missing core search details before we start.")
             return
@@ -432,11 +829,19 @@ async def process_extras(message: Message, state: FSMContext):
             search_id=search_id
         )
         
-    except Exception as e:
-        await message.answer(f"I noted that, but had a small hiccup: {str(e)}. Let's continue — anything else?")
+    except Exception:
+        logger.exception('Extra requirement collection failed')
+        await message.answer('I could not save that preference safely. Please rephrase it, and I will keep your existing draft unchanged.')
 
 @router.message(RenterState.waiting_for_availability)
 async def process_availability(message: Message, state: FSMContext):
+    if not message.text or not message.text.strip():
+        await message.answer('Please describe your availability as text.')
+        return
+    decision = await _classify_renter_turn(message, state)
+    if RenterIntent.SET_AVAILABILITY not in decision.intents:
+        if await _handle_conversational_decision(message, state, decision):
+            return
     await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
     user_id = await get_or_create_user(message)
     
@@ -446,8 +851,9 @@ async def process_availability(message: Message, state: FSMContext):
     try:
         await sched_service.parse_and_save_availability(user_id, None, message.text)
         await message.answer("✅ Availability saved! I'll use this when landlords propose times.")
-    except Exception as e:
-        await message.answer(f"Failed to save availability: {e}")
+    except Exception:
+        logger.exception('Availability collection failed')
+        await message.answer('I could not save that availability. Try something like weekends anytime or weekdays after 6 PM.')
     finally:
         await state.clear()
 
@@ -632,9 +1038,19 @@ async def process_skip_callback(callback: CallbackQuery):
 # ─── FALLBACK (must be LAST) ───
 
 @router.message()
-async def renter_fallback(message: Message):
-    await message.answer(
-        "I didn't quite catch that. Type /help to see what I can do, "
-        "or say <b>hi</b> to start searching for a flat!",
-        parse_mode="HTML",
-    )
+async def renter_fallback(message: Message, state: FSMContext):
+    if is_admin_menu_active(message.chat.id):
+        return
+    if not message.text or not message.text.strip():
+        await message.answer('Please send text so I can help with your flat search, requirements, matches, or rental questions.')
+        return
+    decision = await _classify_renter_turn(message, state)
+    if await _handle_conversational_decision(message, state, decision):
+        await _remember_turn(state, 'user', message.text)
+        tracer.log_event(
+            'RENTER_TURN_ROUTED',
+            override_telegram_user_id=message.from_user.id,
+            payload={'intents': [item.value for item in decision.intents], 'confidence': decision.confidence},
+        )
+        return
+    await message.answer('Tell me whether you want to start a search, view or edit your requirements, check matches, or ask a rental question.')

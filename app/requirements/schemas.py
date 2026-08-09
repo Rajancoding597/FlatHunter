@@ -1,13 +1,14 @@
 ﻿from pydantic import BaseModel, Field
-from typing import List, Optional, Dict
-from app.common.enums import ListingType, PreferenceImportance
+from enum import Enum
+from typing import Any, List, Optional, Dict
+from app.common.enums import PreferenceImportance
 
 class PreferenceValue(BaseModel):
     value: str | int | bool
     importance: PreferenceImportance
 
 class RequirementExtractionResponse(BaseModel):
-    is_complete: bool = Field(description="True ONLY if you have gathered the user's Location, Budget, and Property Type (BHK). False if any of these are missing.")
+    is_complete: bool = Field(description="True only after listing type, location, maximum budget, and move-in timing are all explicit.")
     follow_up_question: Optional[str] = Field(default=None, description="If is_complete is False, generate a natural, conversational question to ask the user for the missing mandatory info.")
     conversational_summary: Optional[str] = Field(default=None, description="If is_complete is True, write a friendly confirmation message to the user summarizing their search.")
     
@@ -40,4 +41,28 @@ class RequirementEditResponse(BaseModel):
     preferred_property_configurations: Optional[List[str]] = None
     core_preferences: Optional[Dict[str, PreferenceValue]] = None
     additional_preferences: Optional[Dict[str, str]] = None
+    conversational_summary: Optional[str] = None
+
+
+class RequirementChangeOperation(str, Enum):
+    '''Explicit semantics for a renter-requested search change.'''
+
+    ADD = 'ADD'
+    REMOVE = 'REMOVE'
+    REPLACE = 'REPLACE'
+    SET = 'SET'
+
+
+class RequirementFieldChange(BaseModel):
+    '''One operation against an editable search-requirement field.'''
+
+    field: str
+    operation: RequirementChangeOperation
+    value: Any = None
+
+
+class RequirementEditPlan(BaseModel):
+    '''Operation-aware edit plan produced from one renter message.'''
+
+    changes: List[RequirementFieldChange] = Field(default_factory=list)
     conversational_summary: Optional[str] = None

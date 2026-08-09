@@ -51,7 +51,18 @@ FlatHunter is a Telegram-first rental search concierge for Hyderabad.
    python -m app.main
    ```
 
+## Renter Conversation
+
+Renter mode accepts both Telegram commands and natural English. Renters can provide or
+edit requirements, ask what has been collected, check search status and matches, discuss
+property details, set visit availability, and pause, resume, or cancel a search. Questions
+asked during requirement collection do not discard the current flow. Destructive or
+core-criteria changes require confirmation through buttons or a natural yes/no reply.
+
+Incomplete conversations and pending confirmations use in-memory Telegram FSM storage in
+V0, so they reset when the bot process restarts. Saved drafts and live searches remain in
+Supabase.
+
 ## Next Steps
 - Apply Supabase migrations (when available)
-- Implement Renter requirement collection flow
 - Implement Admin property ingestion flow

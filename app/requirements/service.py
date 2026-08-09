@@ -1,16 +1,43 @@
 ﻿from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID
 
 from app.common.enums import SearchStatus
 from app.db.models import SearchSession
-from app.requirements.schemas import RequirementEditResponse, RequirementExtractionResponse
+from app.requirements.schemas import (
+    RequirementChangeOperation,
+    RequirementEditPlan,
+    RequirementEditResponse,
+    RequirementExtractionResponse,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 class RequirementService:
     """Owns deterministic search-profile validation and lifecycle writes."""
+
+    EDITABLE_FIELDS = {
+        'listing_types', 'preferred_locations', 'acceptable_locations',
+        'excluded_locations', 'work_location', 'target_rent', 'max_rent',
+        'preferred_move_in_date', 'latest_move_in_date',
+        'preferred_property_configurations', 'core_preferences',
+        'additional_preferences',
+    }
+    LIST_FIELDS = {
+        'listing_types', 'preferred_locations', 'acceptable_locations',
+        'excluded_locations', 'preferred_property_configurations',
+    }
+    DICT_FIELDS = {'core_preferences', 'additional_preferences'}
+    CORE_CHANGE_FIELDS = {
+        'listing_types', 'target_rent', 'max_rent',
+        'preferred_move_in_date', 'latest_move_in_date',
+        'preferred_property_configurations', 'excluded_locations',
+    }
 
     def __init__(self, db: Optional[Any] = None, llm: Optional[Any] = None):
         if db is None:
@@ -62,6 +89,37 @@ class RequirementService:
             return await self.llm.generate_structured(prompt, RequirementEditResponse)
         except Exception as error:
             raise ValueError(f"Failed to parse search update: {error}") from error
+
+    async def parse_search_edit_plan(self, text: str, current_requirements: dict) -> RequirementEditPlan:
+        '''Extract explicit ADD, REMOVE, REPLACE, or SET operations.'''
+        prompt = f'''
+        You update an existing Hyderabad rental search. Convert only the renters explicit
+        request into ordered operations. Never repeat unchanged values.
+
+        Current saved requirements: {current_requirements}
+        Renter update: {text!r}
+
+        Rules:
+        - Return JSON matching RequirementEditPlan.
+        - Valid fields are: {sorted(self.EDITABLE_FIELDS)}.
+        - ADD appends a value without removing existing values.
+        - REMOVE deletes only explicitly named values or keys.
+        - REPLACE replaces an entire list or dictionary.
+        - SET assigns one scalar field.
+        - Use a list value for list-field ADD, REMOVE, and REPLACE operations.
+        - For core_preferences values use a mapping keyed by preference name, with value
+          and importance. Importance is REQUIRED or PREFERRED.
+        - Do not invent changes and do not perform any operation yourself.
+        '''
+        try:
+            plan = await self.llm.generate_structured(prompt, RequirementEditPlan)
+        except Exception as error:
+            logger.exception('Operation-aware search edit parsing failed')
+            raise ValueError('I could not understand that search update. Please rephrase it.') from error
+        invalid = sorted({change.field for change in plan.changes} - self.EDITABLE_FIELDS)
+        if invalid:
+            raise ValueError(f'Unsupported search field: {invalid[0]}')
+        return plan
 
     @staticmethod
     def missing_core_requirements(requirements: RequirementExtractionResponse) -> list[str]:
@@ -191,6 +249,148 @@ class RequirementService:
             else:
                 merged[field] = value
         return merged
+
+    @classmethod
+    def apply_edit_plan(cls, current: dict, plan: RequirementEditPlan) -> dict:
+        '''Resolve an operation-aware plan into a complete requirement snapshot.'''
+        resolved = dict(current)
+        for change in plan.changes:
+            field = change.field
+            if field not in cls.EDITABLE_FIELDS:
+                raise ValueError(f'Unsupported search field: {field}')
+            operation = change.operation
+            value = cls._plain_value(change.value)
+
+            if field in cls.LIST_FIELDS:
+                existing = list(resolved.get(field) or [])
+                values = value if isinstance(value, list) else [value]
+                values = [item for item in values if item is not None]
+                if operation == RequirementChangeOperation.ADD:
+                    known = {str(item).casefold() for item in existing}
+                    for item in values:
+                        normalized = str(item).casefold()
+                        if normalized not in known:
+                            existing.append(item)
+                            known.add(normalized)
+                    resolved[field] = existing
+                elif operation == RequirementChangeOperation.REMOVE:
+                    removed = {str(item).casefold() for item in values}
+                    resolved[field] = [item for item in existing if str(item).casefold() not in removed]
+                elif operation in {RequirementChangeOperation.REPLACE, RequirementChangeOperation.SET}:
+                    resolved[field] = values
+                continue
+
+            if field in cls.DICT_FIELDS:
+                existing = dict(resolved.get(field) or {})
+                if operation == RequirementChangeOperation.REMOVE:
+                    if isinstance(value, list):
+                        keys = value
+                    elif isinstance(value, dict):
+                        keys = list(value)
+                    else:
+                        keys = [value]
+                    for key in keys:
+                        existing.pop(str(key), None)
+                    resolved[field] = existing
+                elif operation == RequirementChangeOperation.REPLACE:
+                    if not isinstance(value, dict):
+                        raise ValueError(f'{field} must be replaced with a mapping')
+                    resolved[field] = value
+                elif operation in {RequirementChangeOperation.ADD, RequirementChangeOperation.SET}:
+                    if not isinstance(value, dict):
+                        raise ValueError(f'{field} must be updated with a mapping')
+                    existing.update(value)
+                    resolved[field] = existing
+                continue
+
+            if operation == RequirementChangeOperation.ADD:
+                raise ValueError(f'ADD is not valid for scalar field {field}')
+            resolved[field] = None if operation == RequirementChangeOperation.REMOVE else value
+        return resolved
+
+    @classmethod
+    def edit_plan_is_risky(cls, current: dict, plan: RequirementEditPlan) -> bool:
+        '''Return whether explicit confirmation is required before persistence.'''
+        for change in plan.changes:
+            if change.operation in {RequirementChangeOperation.REMOVE, RequirementChangeOperation.REPLACE}:
+                return True
+            if change.field in cls.CORE_CHANGE_FIELDS:
+                return True
+            if change.field in {'preferred_locations', 'acceptable_locations'}:
+                if change.operation != RequirementChangeOperation.ADD:
+                    return True
+                continue
+            if change.field == 'core_preferences':
+                value = cls._plain_value(change.value)
+                if not isinstance(value, dict):
+                    return True
+                existing = current.get('core_preferences') or {}
+                for key, item in value.items():
+                    detail = cls._plain_value(item)
+                    importance = detail.get('importance') if isinstance(detail, dict) else None
+                    if str(importance).upper().endswith('REQUIRED') or key in existing:
+                        return True
+        return False
+
+    def update_live_search_from_plan(
+        self,
+        user_id: UUID,
+        search_id: UUID,
+        plan: RequirementEditPlan,
+        raw_text: str,
+        expected_version: Optional[int] = None,
+    ) -> tuple[int, dict]:
+        '''Apply a renter-owned edit plan with optimistic concurrency protection.'''
+        session_result = self.db.table('search_sessions').select('*').eq('id', str(search_id)).eq('user_id', str(user_id)).execute()
+        if not session_result.data:
+            raise ValueError('Search was not found for this renter')
+        session = session_result.data[0]
+        if session.get('status') not in {SearchStatus.ACTIVE.value, SearchStatus.PAUSED.value}:
+            raise ValueError('Only an active or paused search can be edited')
+        current_version = int(session.get('version') or 1)
+        if expected_version is not None and current_version != int(expected_version):
+            raise RuntimeError('Your search changed elsewhere; please review the update again')
+
+        requirement_result = self.db.table('search_requirements').select('*').eq('search_id', str(search_id)).execute()
+        if not requirement_result.data:
+            raise ValueError('Search requirements are missing')
+        current = requirement_result.data[0]
+        merged = self.apply_edit_plan(current, plan)
+        missing = self._missing_persisted_core_requirements(merged)
+        if missing:
+            missing_text = ', '.join(missing)
+            raise ValueError(f'This update would remove required search details: {missing_text}')
+
+        next_version = current_version + 1
+        update_result = self.db.table('search_sessions').update({'version': next_version}).eq('id', str(search_id)).eq('user_id', str(user_id)).eq('version', current_version).execute()
+        if not update_result.data:
+            raise RuntimeError('Your search changed elsewhere; please send the update again')
+        raw = current.get('raw_requirement_text') or ''
+        merged['raw_requirement_text'] = f'{raw}\nUpdate: {raw_text}'.strip()
+        payload = {key: merged.get(key) for key in self._requirements_payload_fields()}
+        self.db.table('search_requirements').update(payload).eq('search_id', str(search_id)).execute()
+        self._queue_match_job('SEARCH_UPDATED', search_id, next_version, 'SEARCH_UPDATED')
+        return next_version, merged
+
+    @staticmethod
+    def _plain_value(value: Any) -> Any:
+        if hasattr(value, 'model_dump'):
+            return value.model_dump()
+        if isinstance(value, dict):
+            return {key: RequirementService._plain_value(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [RequirementService._plain_value(item) for item in value]
+        return value
+
+    @staticmethod
+    def _requirements_payload_fields() -> set[str]:
+        return {
+            'listing_types', 'preferred_locations', 'acceptable_locations',
+            'excluded_locations', 'work_location', 'target_rent', 'max_rent',
+            'preferred_move_in_date', 'latest_move_in_date',
+            'preferred_property_configurations', 'additional_preferences',
+            'raw_requirement_text', 'core_preferences',
+        }
 
     def _queue_match_job(self, job_type: str, search_id: UUID, version: int, trigger: str) -> None:
         key = f"{job_type}:{search_id}:{version}"

@@ -122,7 +122,7 @@ class IngestionService:
             "room_occupancy": payload.get("room_occupancy"), "rent": payload["rent"],
             "maintenance": payload.get("maintenance"), "maintenance_mandatory": payload.get("maintenance_mandatory"),
             "deposit": payload.get("deposit"), "brokerage": payload.get("brokerage"), "available_from": payload.get("available_from"),
-            "availability_status": AvailabilityStatus.UNKNOWN.value, "furnishing": payload.get("furnishing"),
+            "availability_status": AvailabilityStatus.AVAILABLE.value, "furnishing": payload.get("furnishing"),
             "attached_bathroom": payload.get("attached_bathroom"), "car_parking": payload.get("car_parking"),
             "bike_parking": payload.get("bike_parking"), "extracted_context": draft.get("extracted_context") or {},
             "source_summary": payload.get("source_summary"), "created_from_draft_id": str(draft_id),
