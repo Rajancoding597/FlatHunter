@@ -331,14 +331,16 @@ async def process_extras(message: Message, state: FSMContext):
             [InlineKeyboardButton(text="🚀 Start Search", callback_data="action_start_search")]
         ])
         
+        summary = parsed_reqs.conversational_summary or "✅ Noted! I'll factor that into your search."
+        
         await message.answer(
-            "✅ Noted! I'll factor that into your search.\n\n"
+            f"{summary}\n\n"
             "Anything else? Or click below to begin! 🚀",
             parse_mode="HTML",
             reply_markup=keyboard
         )
         
-        chat_history.append(f"Bot: Noted! I'll factor that into your search.")
+        chat_history.append(f"Bot: {summary}")
         await state.update_data(
             chat_history=chat_history,
             parsed_reqs=parsed_reqs.model_dump(),

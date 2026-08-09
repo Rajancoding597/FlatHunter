@@ -1,0 +1,634 @@
+FLATHUNTER V0
+Start Search &
+Matching Engine
+End-to-End Functional and Technical Specification
+Behavioral contract
+
+1. Purpose
+This document defines exactly what FlatHunter V0 does after a renter confirms requirements and clicks Start Search, and it specifies the matching algorithm used to evaluate admin-approved property inventory.
+It is intended to be implementation-ready for a coding agent or engineer. It covers:
+• Preconditions for starting a search
+• Telegram callback behavior and idempotency
+• Search activation and background job creation
+• Inventory eligibility
+• Hard-constraint evaluation
+• Deterministic fit scoring
+• Information completeness
+• Unknown and stale information
+• Match classification
+• Match persistence
+• Renter notification behavior
+• Re-evaluation when new listings arrive or requirements change
+• Qualification handoff
+• Worked examples
+• Pseudocode and test cases
+The key product principle is:
+
+2. Executive Summary
+When the renter clicks Start Search, FlatHunter should not perform a new web scrape. V0 searches the inventory that has already been approved by the admin and stored in Supabase.
+The initial search works as follows:
+
+After the initial run, the search stays active. Every newly approved listing is evaluated against all active searches without requiring the renter to press Search Again.
+3. V0 Assumptions and Boundaries
+3.1 In scope
+• One active search per renter
+• Hyderabad inventory
+• Listing types:
+– ENTIRE_PROPERTY
+– PRIVATE_ROOM
+– SHARED_ROOM
+• Admin-approved inventory only
+• Deterministic core matching
+• Optional bounded LLM reasoning for flexible soft preferences
+• fit_score and information_completeness as separate concepts
+• Renter approval before first outreach to a lead
+• Search remains active until paused or closed
+3.2 Out of scope for this algorithm
+• Facebook/web scraping
+• Route-time or traffic-based commute scoring
+• Vector similarity search as a primary matcher
+• Autonomous negotiation
+• Automatic contact without renter approval
+• Multi-city location intelligence
+• Multiple active searches per renter
+• Visual-quality analysis of flat photos
+4. Core Domain Inputs
+The matching engine receives two normalized objects.
+4.1 Search Profile
+Minimum conceptual shape:
+
+4.2 Listing Snapshot
+Minimum conceptual shape:
+
+The matching engine must never mutate either object while evaluating it. It produces a separate MatchEvaluation.
+5. Preconditions Before Start Search
+The Telegram Start Search button should be enabled only when the core requirement profile is sufficiently defined.
+Required core information:
+
+Optional requirements such as furnishing, parking, attached bathroom, brokerage, deposit, balcony, flatmate preferences, etc. do not block search creation.
+If the user clicks Start Search while a core field is missing, do not activate the search. Return the user to requirement collection and ask only for the missing core information.
+6. What Happens When the User Clicks Start Search
+6.1 Telegram callback
+Expected callback concept:
+
+The handler must:
+1. Resolve Telegram user -> FlatHunter renter.
+2. Load the referenced search.
+3. Verify the search belongs to that renter.
+4. Verify the search is not CLOSED unless a supported reopen action exists.
+5. Validate required core fields.
+6. Apply idempotency rules.
+6.2 Immediate user experience
+The bot should acknowledge quickly instead of blocking while every listing is evaluated.
+Recommended response:
+
+The matching run happens as a background job.
+6.3 Search activation transaction
+Within a database transaction:
+• Set search_sessions.status = ACTIVE.
+• Increment search_sessions.version if this is a materially new or updated requirement snapshot.
+• Store/confirm normalized weight profile.
+• Store started_at if this is the first activation.
+• Update last_activated_at.
+• Create a MATCH_ACTIVE_SEARCH job containing:
+– search_id
+– search_version
+– trigger = SEARCH_STARTED
+• Commit.
+6.4 Idempotency
+Repeated taps must not create duplicate search runs or duplicate notifications.
+Rules:
+• If the same search/version is already ACTIVE and has a pending/running initial match job, reuse it.
+• A unique job key may be:
+
+• Match persistence must use upsert semantics.
+• Notification emission must use a unique notification/event key.
+7. Initial Inventory Selection
+The worker does not load every database row blindly. V0 should apply inexpensive deterministic prefilters before full evaluation.
+7.1 Eligible listing conditions
+A listing can enter matching when:
+• Admin approved it.
+• content_type = PROPERTY_LISTING.
+• It belongs to Hyderabad in V0.
+• It has a supported listing type.
+• It is not explicitly UNAVAILABLE.
+UNKNOWN, AVAILABLE, and STALE listings may enter matching.
+7.2 Useful database prefilters
+Safe prefilters include:
+• approved = true
+• city = 'Hyderabad'
+• availability_status != 'UNAVAILABLE'
+• listing type in supported types
+Potentially apply explicit cheap constraints such as incompatible listing type before loading a large record, but the application-level evaluator remains the source of truth.
+7.3 Do not prefilter on unknown-sensitive attributes
+Do not use a SQL filter such as:
+
+when attached bathroom is required, because a row with attached_bathroom IS NULL must remain a candidate for qualification.
+Correct semantic filter is closer to:
+
+or perform the check in application code.
+8. Matching Engine: End-to-End Pipeline
+Each (search, listing) pair is evaluated independently.
+
+The LLM does not choose the hard-rejection decision, final deterministic score, or persistent match state.
+9. Hard-Constraint Algorithm
+9.1 Principle
+A hard constraint rejects only when the application has explicit reliable evidence of violation.
+Unknown does not reject.
+9.2 Hard rejection rules
+
+9.3 Monthly cost basis
+V0 uses:
+
+when mandatory maintenance is explicitly known.
+If maintenance is unknown:
+• Do not assume it is zero.
+• Use known rent for fit estimation.
+• Add maintenance as a financial information gap when it can materially affect the renter's max budget.
+• Do not reject unless a known value already exceeds the hard maximum.
+9.4 Generic required-attribute rule
+For each search requirement where importance = REQUIRED:
+
+9.5 Hard failure output
+Example:
+
+Once a definitive hard failure is found, V0 may short-circuit scoring for efficiency, while still collecting multiple cheap failures if useful for debugging.
+10. Fit Score Philosophy
+The fit score answers:
+
+It does not answer how confident we are that all important facts are known. That is the job of information_completeness.
+Unknown facts are omitted from the fit denominator rather than treated as negative facts.
+This intentionally allows a listing to have:
+
+That is expected and desirable.
+11. Default Category Weights
+Default V0 weights:
+
+11.1 Personalized weights
+The requirement parser may infer importance from natural language.
+Example:
+
+Possible profile:
+
+Application rules:
+• Clamp every category to a safe range, e.g. 5-50 when applicable.
+• Normalize applicable weights to sum to 100.
+• Hard constraints always override weights.
+• If a category is not relevant to a renter, it can be excluded from the applicable-weight set rather than forcing artificial points.
+12. Atomic Scoring Rules
+Each applicable known factor returns a score fraction from 0.0 to 1.0.
+12.1 Location
+Default locality fractions:
+
+If the renter explicitly says only these areas, represent the allowed location set as a required constraint. Then another locality is an explicit hard violation rather than 0.20.
+12.2 Budget
+Let:
+• T = target monthly budget
+• M = hard maximum monthly budget
+• C = known monthly cost
+Rules:
+
+This gives a fraction of 0.50 exactly at the hard maximum. V0 does not reward being far below target beyond 1.00.
+If only max budget is known, treat T = M for V0 or derive a target only if the renter explicitly provided one.
+12.3 Move-in compatibility
+Let:
+• P = preferred move-in date
+• L = latest acceptable move-in date
+• A = listing available-from date
+Rules:
+
+An earlier availability date is not treated as bad by itself. If a listing explicitly requires immediate occupancy that conflicts with the renter's timing, represent that as a separate explicit condition.
+12.4 Property/room preference fit
+Listing type is primarily a hard gate.
+The property bucket can score applicable known preferences such as:
+• Preferred configuration (2BHK, 3BHK)
+• Preferred occupancy details
+• Private/shared room characteristics beyond the listing-type gate
+If the renter has no such preferences, this category is excluded from the applicable-weight set.
+12.5 Amenities/preferences
+Within this category, split the category weight across relevant canonical preferences.
+Examples:
+• Attached bathroom
+• Furnishing
+• Car parking
+• Bike parking
+• Balcony
+• Pet-friendly requirement
+For each applicable preference:
+
+12.6 Financial terms
+Examples:
+• Brokerage
+• Deposit
+• Mandatory maintenance when separately relevant
+Suggested V0 fractions:
+Brokerage preference = AVOID
+
+If NO_BROKERAGE is marked REQUIRED, any positive known brokerage is a hard rejection.
+Deposit preference
+If renter provides a hard maximum, explicit amount above it rejects. If renter merely prefers a lower deposit, use a simple monotonic fraction and tune later.
+13. Exact Fit Score Formula
+Let each known scoring factor i have:
+• w_i = its effective weight
+• f_i = fit fraction from 0.0 to 1.0
+Unknown factors are not included in the known set K.
+
+Round to the nearest integer for renter-facing display; keep higher precision internally if useful.
+13.1 Why normalization over known facts matters
+If parking is unknown, it should not silently count as failed parking. Removing that factor from the denominator preserves the listing's estimated fit while completeness communicates uncertainty.
+13.2 Minimum score evidence
+To avoid absurdly high fit based on only one known field, V0 should require a minimum core evidence set before treating the score as actionable.
+Recommended core evidence for actionable ranking:
+• listing type known
+• locality known
+• rent known
+If fewer than these three are known, store the evaluation but classify it as NEEDS_QUALIFICATION or data-quality review regardless of numerical fit.
+14. Information Completeness Algorithm
+Completeness answers:
+
+14.1 Relevance-based information weights
+Build the renter-specific relevant fact list using the following default information weights:
+
+Do not include facts the renter does not care about.
+14.2 Knownness
+A fact is known only when the stored canonical value is explicit and reliable enough for application logic.
+• true, false, numeric value, enum value, explicit date -> known
+• null / missing -> unknown
+• availability_status = UNKNOWN -> availability confirmation is not complete
+• availability_status = STALE -> treat freshness/availability as incomplete
+• availability_status = AVAILABLE with non-stale verification -> complete
+14.3 Formula
+
+Round to an integer for display.
+14.4 Completeness never changes hard truth
+A 100% complete listing can still be rejected. A 50% complete listing can still look like a very strong potential fit.
+15. Qualification Gap Generation
+After hard checks and scoring, generate a structured list of unknown facts that matter to the renter.
+Example:
+
+Priority guidance:
+1. Availability
+2. Unknown REQUIRED facts
+3. Facts that can cross a hard financial/date boundary
+4. Important preferences
+5. Low-value optional details
+The qualification workflow should ask only questions relevant to this renter.
+16. Flexible Context and LLM Soft Preference Reasoning
+Canonical deterministic fields remain the source of truth.
+The LLM may evaluate free-form renter preferences against listing.extracted_context only after hard constraints and deterministic core scoring.
+Example input:
+
+Expected output:
+
+V0 rule:
+• Flexible-context reasoning may control at most 30% of the default amenities/preference category.
+• It cannot override an explicit canonical hard failure.
+• It cannot convert an inference into a canonical fact.
+• If the LLM is unavailable, deterministic matching still functions.
+17. Match Classification
+V0 classification is based on hard failures, fit, completeness, availability freshness, and important gaps.
+17.1 REJECTED
+Use when an explicit hard constraint is violated.
+Examples:
+• Wrong listing type
+• Rent/cost above hard max
+• Required attached bathroom explicitly false
+• Explicit excluded locality
+• Explicit move-in date too late
+• Listing unavailable
+17.2 STRONG_MATCH
+Recommended V0 conditions:
+
+Thresholds are product defaults and may be tuned using real Hyderabad data.
+17.3 NEEDS_QUALIFICATION
+Use when the listing appears promising but important information is unresolved.
+Typical rule:
+
+A very high-fit stale listing should normally be NEEDS_QUALIFICATION, not STRONG_MATCH.
+17.4 POSSIBLE_MATCH
+Use for non-rejected listings that do not meet the stronger conditions.
+Recommended visibility tiers:
+
+REJECTED should mean explicit hard incompatibility, not merely a low score.
+17.5 QUALIFIED
+This state is reached later by the qualification workflow when:
+• Availability is confirmed.
+• No hard requirements are violated.
+• All important required unknowns have been resolved.
+• Basic financial and move-in facts needed for the renter are known enough.
+18. Match Evaluation Output Contract
+Recommended application object:
+
+19. Persistence Model for Matches
+At minimum, the matches table should support:
+
+Recommended uniqueness for current-state storage:
+
+Re-evaluation updates the existing row. Historical evaluation events can be introduced later if audit history becomes important.
+20. Ranking Results After Initial Search
+The initial search worker should sort actionable results using deterministic ordering.
+Recommended primary ordering:
+
+Suggested status priority:
+
+Do not show rejected listings to the renter by default.
+21. What the Renter Sees After the Initial Run
+The bot should summarize the run rather than dumping every candidate.
+Example:
+
+Then show a small number of useful cards, for example the top 3-5.
+21.1 Strong match card
+
+21.2 Needs-qualification card
+
+The renter must approve Contact Them before first outreach.
+21.3 No good matches
+If there are no useful candidates:
+
+Do not imply that the agent is scraping external sources in V0.
+22. Notification Policy
+The renter should not be spammed.
+22.1 Initial search
+Send one summary plus the best few actionable matches.
+22.2 New inventory while search is active
+For a newly approved listing:
+• Evaluate it immediately against active searches.
+• Notify only when it crosses the configured usefulness threshold.
+• Prefer immediate notification for exceptional/strong matches.
+• Aggregate lower-priority candidates where practical.
+Recommended V0 behavior:
+
+A future product setting may allow automatic outreach to strong matches, but V0 requires renter approval.
+23. Search Remains Active After Initial Matching
+Clicking Start Search creates a persistent monitoring state, not a one-time query.
+23.1 New listing event
+When admin approves a new listing:
+
+This is more efficient than rescanning every listing for every renter whenever inventory changes.
+23.2 Listing updated
+When a listing changes materially:
+
+Examples of material updates:
+• Rent changes
+• Availability confirmed
+• Attached bathroom clarified
+• Brokerage discovered
+• Listing marked unavailable
+23.3 Search updated
+When a renter changes requirements:
+1. Update normalized requirements.
+2. Increment search_version.
+3. Queue MATCH_ACTIVE_SEARCH for the new version.
+4. Re-evaluate eligible inventory.
+5. Update/upsert matches.
+6. Do not duplicate already-sent outreach without explicit logic.
+Example user change:
+
+The rerun may produce new candidates immediately.
+24. Pausing and Closing Search
+24.1 Pause
+When search becomes PAUSED:
+• Do not evaluate newly approved inventory for that search.
+• Preserve all historical matches.
+• Do not initiate new outreach.
+• Existing confirmed visits remain intact.
+24.2 Resume
+When resumed:
+• Set status back to ACTIVE.
+• Queue a catch-up matching job so listings added during the pause can be evaluated.
+24.3 Close
+When CLOSED:
+• Stop new matching.
+• Stop new outreach.
+• Preserve historical data.
+• Existing visit cancellation/resolution may still be supported as a separate workflow.
+25. Handoff to Qualification
+Matching does not itself contact the owner/broker/current tenant.
+When the renter clicks Contact Them:
+
+The qualification workflow consumes match.gaps in priority order.
+After every inbound reply:
+1. LLM extracts explicit facts.
+2. Backend updates canonical listing facts.
+3. Matching engine re-evaluates the listing for that renter.
+4. Explicit new hard contradiction -> REJECTED and conversation closes politely.
+5. Remaining important gaps -> ask next relevant question.
+6. All necessary facts resolved -> QUALIFIED -> scheduling workflow.
+This reuse of the same matching engine is important. Qualification should not contain a second, inconsistent definition of what a good match means.
+26. Stale Listings
+A stale listing is not automatically rejected.
+
+A stale listing cannot be promoted to STRONG_MATCH until availability has been recently confirmed.
+The renter may be shown:
+
+First outreach still requires renter approval.
+27. Contradictory Listing Data
+Important contradictions should normally have been resolved during admin ingestion.
+If unresolved canonical contradiction somehow reaches matching:
+• Do not let the matcher guess.
+• Mark affected canonical field as unknown/untrusted.
+• Add a data-quality or qualification gap.
+• Prevent STRONG_MATCH classification when the contradiction touches a core/hard-boundary fact.
+Examples:
+• Rent is both 22k and 24k
+• Two incompatible localities
+• Conflicting availability dates
+Admin correction has higher authority than original source text for canonical V0 storage.
+28. Worked Example A - High Fit, Incomplete Information
+Search
+
+Listing A
+
+Hard constraints
+• Listing type: pass
+• Location: pass
+• Known monthly cost = 22,000 <= 23,000: pass
+• Move-in date: pass
+• Attached bathroom required and true: pass
+No hard rejection.
+Score fractions
+• Location: preferred -> 1.00
+• Budget: T=20,000, M=23,000, C=22,000
+
+• Move-in: preferred date -> 1.00
+• Amenities: attached bathroom and furnishing known positive; parking unknown is omitted
+• Financial terms: brokerage unknown -> omitted
+Illustrative known-weight score:
+
+After normalization over known applicable factors, the fit can reasonably be around the high 80s/low 90s depending how amenity subweights are allocated.
+Completeness
+Important unknowns:
+• availability confirmation
+• parking
+• brokerage
+• deposit if renter cares about it
+Result:
+
+Correct behavior: show as promising and ask renter whether FlatHunter should contact the person.
+29. Worked Example B - Attractive Listing but Hard Rejection
+Same renter.
+Listing B
+
+The price and location may score well, but:
+
+Result:
+
+Do not calculate a flattering score and surface it anyway. Hard requirements gate the result.
+30. Worked Example C - Strong Match
+Listing C
+
+Assume no hard deposit cap is violated.
+Expected outcome:
+• Preferred location
+• Within hard budget
+• Move-in within acceptable window
+• Required bathroom satisfied
+• Preferred furnishing satisfied
+• Parking satisfied
+• No brokerage
+• Availability freshly confirmed
+• High completeness
+Result:
+
+Show it prominently to the renter with Contact Them action.
+31. Pseudocode - Start Search Handler
+
+32. Pseudocode - Matching Worker
+
+33. Pseudocode - Pairwise Match Evaluator
+
+34. Pseudocode - New Listing Event
+
+35. Pseudocode - Re-evaluation After Qualification Reply
+
+36. Concurrency and Idempotency
+The system must remain correct when:
+• renter taps Start Search twice
+• same Telegram update is delivered twice
+• worker retries a job after restart
+• same listing is approved twice by a duplicate callback
+• a listing changes while the search worker is running
+V0 safeguards:
+1. Search and listing carry versions.
+2. Match upsert stores versions used for evaluation.
+3. Unique job keys prevent duplicate initial jobs.
+4. Unique notification keys prevent duplicate renter messages.
+5. State transitions verify current state before writing.
+6. Re-evaluate if listing/search version changed materially during a long job.
+A stale evaluation is preferable to a duplicate irreversible action, but current version checks should minimize both.
+37. Performance Strategy for V0
+V0 inventory is expected to be modest enough for deterministic pairwise evaluation.
+37.1 Initial search complexity
+For one search and N eligible listings:
+
+The evaluator uses normal Python operations and database reads.
+37.2 New listing complexity
+For one new listing and A active searches:
+
+This is efficient for the MVP and avoids periodic full cross-product scans.
+37.3 Optimization order if needed later
+Only optimize after measurement:
+1. SQL prefilters for city/listing type/known hard constraints
+2. Batched database reads/writes
+3. Cache normalized search snapshots
+4. Partition active search candidates by city/type
+5. Introduce specialized search infrastructure only when real scale requires it
+Do not add Elasticsearch/vector databases merely for V0 matching.
+38. Observability
+For every matching run, capture enough structured information to debug decisions.
+Recommended metrics/logs:
+• search id/version
+• trigger (SEARCH_STARTED, LISTING_CREATED, SEARCH_UPDATED, LISTING_UPDATED)
+• eligible listing count
+• hard rejected count
+• strong match count
+• needs qualification count
+• possible match count
+• evaluation duration
+• LLM soft-context calls, if any
+• notification count
+• job attempts/failure
+For each match, persist score breakdown and rejection/gap reasons.
+The admin/debug experience should answer:
+
+without needing to reproduce the LLM's hidden reasoning.
+39. Minimum Test Matrix
+39.1 Hard constraints
+• wrong listing type -> reject
+• excluded locality -> reject
+• rent above hard max -> reject
+• required amenity false -> reject
+• required amenity unknown -> not reject
+• move-in date too late -> reject
+• move-in unknown -> gap
+• unavailable listing -> reject
+• stale listing -> not reject
+39.2 Scoring
+• preferred locality scores above acceptable locality
+• target-budget listing scores above near-max listing
+• unknown preferred amenity does not count as false
+• known preferred mismatch lowers fit
+• all known positive preferences produce high fit
+• personalized location-heavy weights change ranking predictably
+39.3 Completeness
+• unknown availability lowers completeness
+• unknown required fact lowers completeness more than optional preference
+• unrelated fields do not affect completeness
+• STALE availability does not count as fresh availability knowledge
+39.4 Classification
+• high fit + high completeness + available -> strong
+• high fit + required unknown -> needs qualification
+• high fit + stale availability -> needs qualification
+• medium fit -> possible
+• hard violation -> rejected regardless of otherwise high score
+39.5 Start Search workflow
+• missing core requirements -> no activation
+• first click -> active + one job
+• duplicate click -> no duplicate job
+• worker restart -> safe retry
+• results notification sent once
+• search remains active after initial run
+39.6 Event-driven re-evaluation
+• new listing evaluated against active search
+• new listing ignored for paused search
+• resume performs catch-up
+• requirement update increments version and reruns inventory
+• listing update changes existing match
+• unavailable update converts affected match to rejected
+40. Acceptance Criteria
+The Start Search and matching feature is complete for V0 when all of the following are true:
+1. A renter with complete core requirements can click Start Search in Telegram.
+2. Search state becomes ACTIVE exactly once.
+3. Initial inventory matching runs asynchronously and idempotently.
+4. Explicit hard contradictions reject listings.
+5. Unknown fields never behave as false by default.
+6. Deterministic fit score is produced from known applicable facts.
+7. Information completeness is calculated separately.
+8. Important unknowns become structured qualification gaps.
+9. Strong, qualification-needed, possible, and rejected outcomes behave consistently.
+10. Renter receives a concise initial result summary and useful top candidates.
+11. No outbound contact happens without renter approval.
+12. Newly approved listings are automatically evaluated against active searches.
+13. Requirement and listing updates trigger deterministic re-evaluation.
+14. Matching decisions are explainable from persisted score breakdown/reasons.
+15. Automated tests cover core hard-constraint, scoring, completeness, classification, and idempotency behavior.
+41. Implementation Order
+Recommended engineering sequence:
+
+The optional LLM soft-context step should be implemented only after the deterministic core is tested with real Hyderabad examples.
+42. Design Decisions to Preserve
+A coding agent implementing this feature should preserve these decisions unless the product specification is explicitly changed:
+• Start Search means activate a persistent search, not run a one-time query.
+• No scraping occurs as part of Start Search in V0.
+• Unknown is not false.
+• Only explicit hard contradiction rejects.
+• Fit and completeness are separate.
+• Core matching is deterministic.
+• LLM reasoning is bounded to unstructured soft context and language understanding.
+• The same evaluator is reused after new facts arrive during qualification.
+• First outreach requires renter approval.
+• New approved inventory automatically flows into active searches.
+• Persist reasons and gaps so decisions are explainable and recoverable.
+43. End-to-End Reference Sequence
+
+This sequence is the V0 behavioral contract for the complete Start Search -> Match -> Qualification -> Visit handoff path.

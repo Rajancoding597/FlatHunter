@@ -5,6 +5,7 @@ from typing import Dict, Any, Tuple, List
 from dataclasses import dataclass, field, asdict
 from app.db.client import get_supabase_client
 from app.common.enums import MatchStatus
+from app.common.tracer import tracer
 
 logger = logging.getLogger(__name__)
 
@@ -35,23 +36,20 @@ class MatchingEngine:
         if pref_types and listing_type not in pref_types:
             eval_result.hard_rejection_reasons.append(f"Listing type {listing_type} is not acceptable. Preferred: {pref_types}")
 
-        locality = listing.get('locality') or ''
-        locality = locality.lower()
-        city = listing.get('city') or ''
-        city = city.lower()
+        locality = listing.get('locality', '').lower()
+        city = listing.get('city', '').lower()
         location_text = f"{locality}, {city}"
         
         pref_locs = [loc.lower() for loc in search_req.get('preferred_locations', [])]
         acc_locs = [loc.lower() for loc in search_req.get('acceptable_locations', [])]
         exc_locs = [loc.lower() for loc in search_req.get('excluded_locations', [])]
-        all_allowed = pref_locs + acc_locs
         
-        if locality or city:
-            if exc_locs and any(loc in locality or loc in city for loc in exc_locs):
-                eval_result.hard_rejection_reasons.append(f"Location {location_text} is explicitly excluded.")
-                
-            if all_allowed and not any(loc in locality or loc in city for loc in all_allowed):
-                 eval_result.hard_rejection_reasons.append(f"Location {location_text} is not in preferred or acceptable locations.")
+        if exc_locs and any(loc in locality or loc in city for loc in exc_locs):
+            eval_result.hard_rejection_reasons.append(f"Location {location_text} is explicitly excluded.")
+            
+        all_allowed = pref_locs + acc_locs
+        if all_allowed and not any(loc in locality or loc in city for loc in all_allowed):
+             eval_result.hard_rejection_reasons.append(f"Location {location_text} is not in preferred or acceptable locations.")
 
         rent = listing.get('rent')
         max_rent = search_req.get('max_rent', 999999)
@@ -61,19 +59,6 @@ class MatchingEngine:
         avail = listing.get('availability_status')
         if avail == 'UNAVAILABLE':
             eval_result.hard_rejection_reasons.append("Listing is explicitly UNAVAILABLE.")
-            
-        avail_from = listing.get('available_from')
-        latest_move_in = search_req.get('latest_move_in_date')
-        if avail_from and latest_move_in:
-            if str(avail_from) > str(latest_move_in):
-                eval_result.hard_rejection_reasons.append(f"Available from {avail_from} is after latest move-in date {latest_move_in}.")
-                
-        brokerage = listing.get('brokerage')
-        if brokerage is not None and float(brokerage) > 0:
-            core_prefs = search_req.get('core_preferences', {})
-            no_brok = core_prefs.get('no_brokerage', {})
-            if isinstance(no_brok, dict) and no_brok.get('importance') == 'REQUIRED':
-                 eval_result.hard_rejection_reasons.append("Listing has brokerage, but No Brokerage is REQUIRED.")
 
         core_prefs = search_req.get('core_preferences', {})
         for pref_key, pref_val in core_prefs.items():
@@ -103,7 +88,6 @@ class MatchingEngine:
         add_info_check("Availability", avail == 'AVAILABLE', 20) # 'UNKNOWN' or 'STALE' are not fresh
         add_info_check("Location", bool(locality or city), 15)
         add_info_check("Listing Type", listing_type is not None, 10)
-        add_info_check("Brokerage", listing.get('brokerage') is not None, 5)
         
         for pref_key, pref_val in core_prefs.items():
             importance = pref_val.get('importance') if isinstance(pref_val, dict) else None
@@ -143,31 +127,6 @@ class MatchingEngine:
                     add_fit_score("Budget", frac, 30)
                 else:
                     add_fit_score("Budget", 0.5, 30)
-                    
-        # Move-in Fit (Weight: 20)
-        pref_move_in = search_req.get('preferred_move_in_date')
-        if avail_from and (pref_move_in or latest_move_in):
-            if pref_move_in and str(avail_from) <= str(pref_move_in):
-                add_fit_score("Move-in Date", 1.0, 20)
-            elif latest_move_in and str(avail_from) <= str(latest_move_in):
-                add_fit_score("Move-in Date", 0.5, 20)
-                
-        # Brokerage Fit (Weight: 10)
-        if brokerage is not None:
-             if float(brokerage) == 0:
-                 add_fit_score("Brokerage", 1.0, 10)
-             else:
-                 add_fit_score("Brokerage", 0.0, 10)
-                    
-        # Property Config Fit (Weight: 20)
-        pref_configs = search_req.get('preferred_property_configurations', [])
-        if pref_configs:
-            listing_config = listing.get('property_configuration')
-            if listing_config:
-                if listing_config in pref_configs:
-                    add_fit_score("Property Configuration", 1.0, 20)
-                else:
-                    add_fit_score("Property Configuration", 0.0, 20)
                     
         # Preference Fit (Weight: 20)
         prefs_to_eval = [k for k in core_prefs.keys() if listing.get(k) is not None]
@@ -220,8 +179,7 @@ class MatchingEngine:
             self._upsert_match(search_id, listing_id, eval_res)
 
     def process_new_search(self, search_id: str):
-        from app.common.tracer import tracer
-        tracer.log_event("RETROACTIVE_MATCHING_STARTED", override_search_id=search_id, payload={"search_id": search_id})
+        tracer.log_event("RETROACTIVE_MATCHING_STARTED", payload={"search_id": search_id})
         
         req_res = self.db.table("search_requirements").select("*").eq("search_id", search_id).execute()
         if not req_res.data: return
@@ -239,7 +197,7 @@ class MatchingEngine:
             if eval_res.status in [MatchStatus.STRONG_MATCH, MatchStatus.POSSIBLE_MATCH, MatchStatus.NEEDS_QUALIFICATION]:
                 matches_found += 1
                 
-        tracer.log_event("RETROACTIVE_MATCHING_COMPLETED", override_search_id=search_id, payload={"search_id": search_id, "matches_found": matches_found})
+        tracer.log_event("RETROACTIVE_MATCHING_COMPLETED", payload={"search_id": search_id, "matches_found": matches_found})
 
     def _upsert_match(self, search_id: str, listing_id: str, eval_res: MatchEvaluation):
         # Check if match already exists to avoid duplicate notifications
@@ -259,10 +217,9 @@ class MatchingEngine:
             "soft_context_evaluation": eval_res.soft_context_evaluation
         }
         
+        # Note: Supabase Python client upsert syntax requires defining the conflict columns if they differ from primary key, 
+        # but here we can just use upsert with on_conflict
         try:
-            # Using Supabase upsert on the matches table. In Supabase, if we want to ensure uniqueness via search_id + listing_id, 
-            # we need to specify on_conflict. If on_conflict fails due to syntax, we might need a fallback.
-            # Usually Supabase handles it smoothly if the UNIQUE constraint is defined.
             self.db.table("matches").upsert(match_data, on_conflict="search_id,listing_id").execute()
         except Exception as e:
             logger.error(f"Failed to upsert match {search_id}-{listing_id}: {e}")
