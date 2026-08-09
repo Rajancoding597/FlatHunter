@@ -5,6 +5,7 @@ class UserRole(StrEnum):
     ADMIN = "ADMIN"
 
 class SearchStatus(StrEnum):
+    DRAFT = "DRAFT"
     ACTIVE = "ACTIVE"
     PAUSED = "PAUSED"
     CLOSED = "CLOSED"
@@ -17,6 +18,7 @@ class ListingType(StrEnum):
 class ContentType(StrEnum):
     PROPERTY_LISTING = "PROPERTY_LISTING"
     RENTER_REQUIREMENT = "RENTER_REQUIREMENT"
+    OTHER = "OTHER"
     UNKNOWN = "UNKNOWN"
 
 class AvailabilityStatus(StrEnum):

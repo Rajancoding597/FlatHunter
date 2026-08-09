@@ -1,0 +1,44 @@
+{
+  "provider": "groq",
+  "model": "qwen/qwen3.6-27b",
+  "test_type": "vision_simple_json",
+  "timestamp": "2026-08-09T09:35:02.583124+00:00",
+  "input_files": [
+    "tests_manual\\groq_vision\\samples\\6323322407233459435.jpg",
+    "tests_manual\\groq_vision\\samples\\6323322407233459436.jpg"
+  ],
+  "success": true,
+  "api_call_worked": true,
+  "vision_tested": true,
+  "json_mode_failed": false,
+  "latency_ms": 39023.17,
+  "request_id": null,
+  "prompt_tokens": 1785,
+  "completion_tokens": 338,
+  "total_tokens": 2123,
+  "response_text": "{\n  \"location\": \"Laxmi Srinivasam, Jagruthi Colony Road. No.3, Beside KIMS Kondapur (15 Minutes from Deloitte, Mindspace and DLF)\",\n  \"rent\": 15833,\n  \"maintenance\": 663,\n  \"deposit\": 25333,\n  \"brokerage\": 6000,\n  \"property_type\": \"3BHK\",\n  \"configuration\": \"1 semi-furnished bedroom\",\n  \"available_from\": \"1st September 2026\",\n  \"contact_number\": null,\n  \"other_details\": [\n    \"Male Flatmate Required\",\n    \"Monthly Utilities (approx.): ₹663/person (Includes Wi-Fi and Rentals)\",\n    \"Cook and Maid - 2916\",\n    \"Setup Cost: ₹2,700 (Kitchen setup and Rental deposits)\",\n    \"1 Ton Croma AC: ₹22,000\",\n    \"Room Features: Huge Wardrobes, Dressing Mirror, Attached Washroom with Geyser, Attached Table\",\n    \"House Amenities: Refrigerator, Washing Machine, Wi-Fi, Gas Stove, Induction, Common Kitchen Utensils\",\n    \"Friendly and well-maintained apartment\",\n    \"Move-in Date: 1st/2nd September 2026\",\n    \"DM me for more details or to schedule a visit\"\n  ],\n  \"uncertain_fields\": []\n}",
+  "response": {
+    "location": "Laxmi Srinivasam, Jagruthi Colony Road. No.3, Beside KIMS Kondapur (15 Minutes from Deloitte, Mindspace and DLF)",
+    "rent": 15833,
+    "maintenance": 663,
+    "deposit": 25333,
+    "brokerage": 6000,
+    "property_type": "3BHK",
+    "configuration": "1 semi-furnished bedroom",
+    "available_from": "1st September 2026",
+    "contact_number": null,
+    "other_details": [
+      "Male Flatmate Required",
+      "Monthly Utilities (approx.): ₹663/person (Includes Wi-Fi and Rentals)",
+      "Cook and Maid - 2916",
+      "Setup Cost: ₹2,700 (Kitchen setup and Rental deposits)",
+      "1 Ton Croma AC: ₹22,000",
+      "Room Features: Huge Wardrobes, Dressing Mirror, Attached Washroom with Geyser, Attached Table",
+      "House Amenities: Refrigerator, Washing Machine, Wi-Fi, Gas Stove, Induction, Common Kitchen Utensils",
+      "Friendly and well-maintained apartment",
+      "Move-in Date: 1st/2nd September 2026",
+      "DM me for more details or to schedule a visit"
+    ],
+    "uncertain_fields": []
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "provider": "groq",
+  "model": "qwen/qwen3.6-27b",
+  "test_type": "vision_plaintext",
+  "timestamp": "2026-08-09T09:34:44.815448+00:00",
+  "input_files": [
+    "tests_manual\\groq_vision\\samples\\6323322407233459435.jpg",
+    "tests_manual\\groq_vision\\samples\\6323322407233459436.jpg"
+  ],
+  "success": true,
+  "api_call_worked": true,
+  "vision_tested": true,
+  "json_mode_failed": false,
+  "latency_ms": 2321.81,
+  "request_id": null,
+  "prompt_tokens": 1793,
+  "completion_tokens": 471,
+  "total_tokens": 2264,
+  "response_text": "Based on the images provided, here is the information visibly present:\n\n**Locality or Location:**\nLaxmi Srinivasam, Jagruthi Colony Road. No.3, Beside KIMS Kondapur (15 Minutes from Deloitte, Mindspace and DLF), Kondapur, Hyderabad.\n\n**Monthly Rent:**\n₹15,833/month (Renewed in June '26)\n\n**Maintenance:**\nUnknown (Not explicitly listed as a separate maintenance fee, though utilities are listed separately).\n\n**Security Deposit:**\n₹25,333\n\n**Brokerage:**\n6000\n\n**Property Type:**\n3BHK (The listing is for a room within a 3BHK apartment).\n\n**Whether this is an entire flat, private room, or shared room:**\nPrivate room (Listing states: \"Looking for a Male flatmate to occupy 1 semi-furnished bedroom\").\n\n**BHK/Configuration:**\n3BHK (The apartment configuration).\n\n**Available-from date:**\n1st September 2026 (Also mentions \"Move-in Date: 1st/2nd September 2026\").\n\n**Furnishing:**\nSemi-furnished.\n\n**Attached bathroom:**\nYes (\"Attached Washroom with Geyser\").\n\n**Parking:**\nUnknown.\n\n**Phone number:**\nUnknown.\n\n**WhatsApp number:**\nUnknown.\n\n**Email:**\nUnknown.\n\n**Any other useful rental-property information:**\n*   **Monthly Utilities:** approx. ₹663/person (Includes Wi-Fi and Rentals).\n*   **Staff:** Cook and Maid - 2916.\n*   **Setup Cost:** ₹2,700 (Kitchen setup and Rental deposits).\n*   **AC Cost:** 1 Ton Croma AC: ₹22,000.\n*   **Room Features:** Huge Wardrobes, Dressing Mirror, Attached Table.\n*   **House Amenities:** Refrigerator, Washing Machine, Wi-Fi, Gas Stove, Induction, Common Kitchen Utensils.\n*   **Contact Method:** The text instructs to \"DM me for more details or to schedule a visit.\""
+}

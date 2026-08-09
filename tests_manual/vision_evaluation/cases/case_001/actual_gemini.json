@@ -1,0 +1,89 @@
+{
+  "case": "case_001",
+  "provider": "gemini",
+  "model": "gemini-2.5-flash-lite",
+  "actual": {
+    "content_type": "PROPERTY_LISTING",
+    "canonical": {
+      "listing_type": "PRIVATE_ROOM",
+      "property_configuration": "3BHK",
+      "city": "Hyderabad",
+      "locality": "Kondapur",
+      "location_text": "Laxmi Srinivasa, Jagruthi Colony Road. No.3, Beside KIMS Kondapur (15 Minutes from Deloitte, Mindspace and DLF)",
+      "landmark": null,
+      "rent": 15833,
+      "maintenance": null,
+      "deposit": 25333,
+      "brokerage": 6000,
+      "available_from": "2026-09-01",
+      "furnishing": "SEMI_FURNISHED",
+      "attached_bathroom": true,
+      "car_parking": null,
+      "bike_parking": null
+    },
+    "contacts": [],
+    "additional_attributes": {
+      "monthly_costs": [
+        {
+          "type": "UTILITIES",
+          "amount": 663,
+          "description": "Monthly Utilities (approx.): ₹663/person (Includes Wi-Fi and Rentals)"
+        },
+        {
+          "type": "COOK_AND_MAID",
+          "amount": 2916,
+          "description": "Cook and Maid"
+        }
+      ],
+      "one_time_costs": [
+        {
+          "type": "SETUP_COST",
+          "amount": 2700,
+          "description": "Setup Cost: ₹2,700 (Kitchen setup and Rental deposits)"
+        },
+        {
+          "type": "APPLIANCE",
+          "amount": 22000,
+          "description": "1 Ton Croma AC: ₹22,000"
+        }
+      ],
+      "room_features": [
+        "Huge Wardrobes",
+        "Dressing Mirror",
+        "Attached Washroom with Geyser",
+        "Attached Table"
+      ],
+      "house_amenities": [
+        "Refrigerator",
+        "Washing Machine",
+        "Wi-Fi",
+        "Gas Stove",
+        "Induction",
+        "Common Kitchen Utensils"
+      ],
+      "other_features": [
+        "Friendly and well-maintained apartment"
+      ],
+      "move_in_date_text": "1st/2nd September 2026"
+    },
+    "conflicts": [],
+    "uncertain_fields": [],
+    "extraction_notes": [
+      "Rent is stated as '₹15,833/month (Renewed in June'26)' which implies it's the current rent and might be subject to change.",
+      "The available from date is a range '1st/2nd September 2026', normalized to the earliest date.",
+      "Furnishing is inferred as 'SEMI_FURNISHED' due to the presence of AC, wardrobes, dressing mirror, attached table, refrigerator, washing machine, gas stove, and induction, but not explicitly stated."
+    ]
+  },
+  "evaluation": {
+    "passed": true,
+    "critical_mismatches": [],
+    "hallucinated_canonical_facts": [],
+    "missing_additional_context": []
+  },
+  "model_metadata": {
+    "request_id": null,
+    "input_tokens": 1376,
+    "output_tokens": 728,
+    "total_tokens": 2104
+  }
+}

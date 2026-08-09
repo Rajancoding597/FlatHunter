@@ -1,9 +1,12 @@
+import logging
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from app.config import settings
 from .renter_handlers import router as renter_router
 from .admin_handlers import router as admin_router
+
+logger = logging.getLogger(__name__)
 
 async def init_bot() -> tuple[Bot, Dispatcher]:
     bot = Bot(
@@ -26,6 +29,9 @@ async def init_bot() -> tuple[Bot, Dispatcher]:
         BotCommand(command="mysearch", description="Check status & matches of your search"),
         BotCommand(command="start", description="Start or restart your flat search"),
         BotCommand(command="cancel_search", description="Cancel your active search"),
+        BotCommand(command="pause", description="Pause alerts and outreach"),
+        BotCommand(command="resume", description="Resume your search"),
+        BotCommand(command="editsearch", description="Update your saved search"),
         BotCommand(command="set_availability", description="Set your availability for visits"),
         BotCommand(command="help", description="Show available commands"),
     ]
@@ -34,6 +40,8 @@ async def init_bot() -> tuple[Bot, Dispatcher]:
     admin_commands = [
         BotCommand(command="addlisting", description="Add a new property"),
         BotCommand(command="bulkadd", description="Add multiple properties"),
+        BotCommand(command="renter", description="Test renter flow in this chat"),
+        BotCommand(command="admin", description="Return to admin actions"),
         BotCommand(command="status", description="View system metrics"),
         BotCommand(command="viewsearches", description="View active renters' searches"),
         BotCommand(command="viewlistings", description="View recent active listings"),

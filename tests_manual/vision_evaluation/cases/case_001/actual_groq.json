@@ -1,0 +1,84 @@
+{
+  "case": "case_001",
+  "provider": "groq",
+  "model": "qwen/qwen3.6-27b",
+  "actual": {
+    "content_type": "PROPERTY_LISTING",
+    "canonical": {
+      "listing_type": "PRIVATE_ROOM",
+      "property_configuration": "3BHK",
+      "city": "Hyderabad",
+      "locality": "Kondapur",
+      "location_text": "Laxmi Srinivasam, Jagruthi Colony Road. No.3, Beside KIMS Kondapur (15 Minutes from Deloitte, Mindspace and DLF)",
+      "landmark": "Beside KIMS Kondapur",
+      "rent": 15833,
+      "maintenance": null,
+      "deposit": 25333,
+      "brokerage": 6000,
+      "available_from": "2026-09-01",
+      "furnishing": "SEMI_FURNISHED",
+      "attached_bathroom": true,
+      "car_parking": null,
+      "bike_parking": null
+    },
+    "contacts": [],
+    "additional_attributes": {
+      "monthly_costs": [
+        {
+          "type": "UTILITIES",
+          "amount": 663,
+          "description": "Monthly Utilities (approx.) (Includes Wi-Fi and Rentals)"
+        },
+        {
+          "type": "STAFF",
+          "amount": 2916,
+          "description": "Cook and Maid"
+        }
+      ],
+      "one_time_costs": [
+        {
+          "type": "SETUP",
+          "amount": 2700,
+          "description": "Setup Cost (Kitchen setup and Rental deposits)"
+        },
+        {
+          "type": "APPLIANCE",
+          "amount": 22000,
+          "description": "1 Ton Croma AC"
+        }
+      ],
+      "room_features": [
+        "Huge Wardrobes",
+        "Dressing Mirror",
+        "Attached Washroom with Geyser",
+        "Attached Table"
+      ],
+      "house_amenities": [
+        "Refrigerator",
+        "Washing Machine",
+        "Wi-Fi",
+        "Gas Stove",
+        "Induction",
+        "Common Kitchen Utensils"
+      ],
+      "tenant_requirement": "Male Flatmate",
+      "move_in_date_range": "1st/2nd September 2026",
+      "rent_renewal": "June '26"
+    },
+    "conflicts": [],
+    "uncertain_fields": [],
+    "extraction_notes": []
+  },
+  "evaluation": {
+    "passed": true,
+    "critical_mismatches": [],
+    "hallucinated_canonical_facts": [],
+    "missing_additional_context": []
+  },
+  "model_metadata": {
+    "request_id": null,
+    "input_tokens": 2397,
+    "output_tokens": 593,
+    "total_tokens": 2990
+  }
+}

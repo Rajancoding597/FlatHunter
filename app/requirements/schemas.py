@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+﻿from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
 from app.common.enums import ListingType, PreferenceImportance
 
@@ -23,3 +23,21 @@ class RequirementExtractionResponse(BaseModel):
     preferred_property_configurations: Optional[List[str]] = Field(default=None, description="e.g. 1BHK, 2BHK, 3BHK")
     core_preferences: Dict[str, PreferenceValue] = Field(default={}, description="Dict of explicit preferences like furnishing, attached_bathroom, brokerage")
     additional_preferences: Dict[str, str] = Field(default={}, description="Any other free-form preferences not covered above")
+
+
+class RequirementEditResponse(BaseModel):
+    """Only fields explicitly changed by a renter's search-edit message."""
+
+    listing_types: Optional[List[str]] = None
+    preferred_locations: Optional[List[str]] = None
+    acceptable_locations: Optional[List[str]] = None
+    excluded_locations: Optional[List[str]] = None
+    work_location: Optional[str] = None
+    target_rent: Optional[int] = None
+    max_rent: Optional[int] = None
+    preferred_move_in_date: Optional[str] = None
+    latest_move_in_date: Optional[str] = None
+    preferred_property_configurations: Optional[List[str]] = None
+    core_preferences: Optional[Dict[str, PreferenceValue]] = None
+    additional_preferences: Optional[Dict[str, str]] = None
+    conversational_summary: Optional[str] = None

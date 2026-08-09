@@ -17,6 +17,33 @@ FlatHunter is a Telegram-first rental search concierge for Hyderabad.
    - `SUPABASE_URL`: Your Supabase project URL
    - `SUPABASE_SERVICE_KEY`: Your Supabase service role key
    - `GEMINI_API_KEY`: Google Gemini API key
+   - `VISION_PROVIDER`: Explicit listing-vision provider, `gemini` (default) or `groq`
+   - `GROQ_API_KEY`: Required when `VISION_PROVIDER=groq`
+   - `GROQ_VISION_MODEL`: Defaults to `qwen/qwen3.6-27b`
+   - `GEMINI_VISION_MODEL`: Defaults to `gemini-2.5-flash-lite`
+
+   Groq example:
+
+   ```env
+   VISION_PROVIDER=groq
+   GROQ_API_KEY=your-key
+   GROQ_VISION_MODEL=qwen/qwen3.6-27b
+   ```
+
+   Gemini example:
+
+   ```env
+   VISION_PROVIDER=gemini
+   GEMINI_API_KEY=your-key
+   GEMINI_VISION_MODEL=gemini-2.5-flash-lite
+   ```
+
+   Vision selection is independent from `LLM_PROVIDER`; there is no automatic
+   provider fallback. The `/addlisting` flow sends all information screenshots
+   for one property in one extraction request. Property gallery photos remain
+   media and are not sent to vision models in V0. Provider output is validated
+   as `FlatHunterExtractionV1`, unknown values remain null, and every successful
+   extraction remains a draft until admin approval.
 
 3. **Running the Application**
    For local development (runs FastAPI server + Telegram long polling bot):

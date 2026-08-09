@@ -1,3 +1,4 @@
+import asyncio
 import time
 import json
 import logging
@@ -115,7 +116,7 @@ class GroqProvider:
                         error=f"Attempt {attempt + 1} failed with 429: {str(e)}",
                         schema_name=schema_name
                     )
-                    time.sleep(wait_time)
+                    await asyncio.sleep(wait_time)
                 else:
                     tracer.log_llm_call(
                         provider="groq",
@@ -156,7 +157,7 @@ class GroqProvider:
                 if "429" in str(e) and attempt < self.max_retries - 1:
                     wait_time = 10 * (attempt + 1)
                     logger.warning(f"Groq Rate limited (attempt {attempt + 1}/{self.max_retries}). Retrying in {wait_time}s...")
-                    time.sleep(wait_time)
+                    await asyncio.sleep(wait_time)
                 else:
                     tracer.log_llm_call(
                         provider="groq",
@@ -232,7 +233,7 @@ class GeminiProvider:
                         error=f"Attempt {attempt + 1} failed with 429: {str(e)}",
                         schema_name=schema_name
                     )
-                    time.sleep(wait_time)
+                    await asyncio.sleep(wait_time)
                 else:
                     tracer.log_llm_call(
                         provider="gemini",
@@ -267,7 +268,7 @@ class GeminiProvider:
                 if "429" in str(e) and attempt < self.max_retries - 1:
                     wait_time = 32 * (attempt + 1)
                     logger.warning(f"Gemini Rate limited (attempt {attempt + 1}/{self.max_retries}). Retrying in {wait_time}s...")
-                    time.sleep(wait_time)
+                    await asyncio.sleep(wait_time)
                 else:
                     tracer.log_llm_call(
                         provider="gemini",
@@ -282,8 +283,17 @@ class GeminiProvider:
 
 
 def get_llm_provider():
-    """Factory function to get the configured LLM provider."""
-    if settings.llm_provider == "groq":
+    """Return the explicitly configured supported provider.
+
+    Failing on an invalid setting is safer than silently sending renter or listing
+    data to a provider the operator did not select.
+    """
+    provider = settings.llm_provider.strip().lower()
+    if provider == "groq":
         return GroqProvider()
-    else:
+    if provider == "gemini":
         return GeminiProvider()
+    raise ValueError(
+        f"Unsupported LLM_PROVIDER={settings.llm_provider!r}. "
+        "Supported values are: groq, gemini."
+    )

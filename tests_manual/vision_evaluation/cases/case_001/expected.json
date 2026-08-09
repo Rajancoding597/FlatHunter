@@ -1,0 +1,36 @@
+{
+  "content_type": "PROPERTY_LISTING",
+  "canonical": {
+    "listing_type": "PRIVATE_ROOM",
+    "property_configuration": "3BHK",
+    "city": "Hyderabad",
+    "locality": "Kondapur",
+    "rent": 15833,
+    "maintenance": null,
+    "deposit": 25333,
+    "brokerage": 6000,
+    "available_from": "2026-09-01",
+    "furnishing": "SEMI_FURNISHED",
+    "attached_bathroom": true,
+    "car_parking": null,
+    "bike_parking": null
+  },
+  "contacts": [],
+  "required_context_values": [663, 2916, 2700, 22000],
+  "required_context_terms": [
+    "utilities",
+    "cook",
+    "maid",
+    "setup",
+    "wardrobe",
+    "dressing mirror",
+    "geyser",
+    "refrigerator",
+    "washing machine",
+    "wi-fi",
+    "gas stove",
+    "induction",
+    "kitchen utensils",
+    "male"
+  ]
+}

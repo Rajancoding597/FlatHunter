@@ -9,6 +9,7 @@ from app.requirements.service import RequirementService
 from app.db.client import get_supabase_client
 from app.common.tracer import tracer
 from uuid import uuid4
+from datetime import datetime, timezone
 
 router = Router()
 req_service = RequirementService()
@@ -88,6 +89,41 @@ async def cmd_cancel_search(message: Message, state: FSMContext):
         
     await state.clear()
 
+@router.message(Command("pause"))
+async def cmd_pause_search(message: Message):
+    user_id = await get_or_create_user(message)
+    result = get_supabase_client().table("search_sessions").update({
+        "status": "PAUSED",
+        "paused_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("user_id", user_id).eq("status", "ACTIVE").execute()
+    await message.answer(
+        "Your search is paused. I will not contact or notify you about new listings."
+        if result.data else "You do not have an active search to pause."
+    )
+
+
+@router.message(Command("resume"))
+async def cmd_resume_search(message: Message):
+    user_id = await get_or_create_user(message)
+    db = get_supabase_client()
+    result = db.table("search_sessions").update({
+        "status": "ACTIVE",
+        "last_activated_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("user_id", user_id).eq("status", "PAUSED").execute()
+    if not result.data:
+        await message.answer("You do not have a paused search to resume.")
+        return
+    search = result.data[0]
+    try:
+        req_service._queue_match_job("MATCH_ACTIVE_SEARCH", search["id"], int(search.get("version") or 1), "RESUMED")
+    except Exception:
+        # The status update is already durable; a duplicate job is safe and transient
+        # enqueue failure should be visible in server logs rather than misreported.
+        import logging
+        logging.getLogger(__name__).exception("Could not enqueue resumed search matching", extra={"search_id": search["id"]})
+        await message.answer("Your search is active again. Matching will retry shortly.")
+        return
+    await message.answer("Your search is active again. I am checking listings added while it was paused.")
 @router.message(Command("help"))
 async def cmd_help(message: Message, state: FSMContext):
     current_state = await state.get_state()
@@ -186,10 +222,48 @@ async def cmd_mysearch(message: Message):
         f"• 🎯 Direct Strong Matches: <b>{strong_matches}</b>\n"
         f"• ⏳ Properties In Qualification: <b>{qualifying_matches}</b>\n\n"
         f"<i>I'm continuously scanning new listings. I will message you the moment a flat matches your criteria!</i>\n\n"
-        f"Want to update your search? Tap /start to restart."
+        f"Want to update your search? Use /editsearch."
     )
     await message.answer(summary, parse_mode="HTML")
 
+@router.message(Command("editsearch"))
+async def cmd_edit_search(message: Message, state: FSMContext):
+    user_id = await get_or_create_user(message)
+    try:
+        req_service.get_editable_search(user_id)
+    except ValueError as error:
+        await message.answer(str(error))
+        return
+    await message.answer(
+        "Tell me what you want to change, for example: ‘increase my budget to 25k and include Madhapur’."
+    )
+    await state.set_state(RenterState.waiting_for_search_edit)
+
+
+@router.message(RenterState.waiting_for_search_edit)
+async def process_search_edit(message: Message, state: FSMContext):
+    if not message.text or not message.text.strip():
+        await message.answer("Please send the change as text, for example: ‘budget up to 25k’.")
+        return
+    user_id = await get_or_create_user(message)
+    try:
+        session, current = req_service.get_editable_search(user_id)
+        async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
+            patch = await req_service.parse_search_edit(message.text, current)
+        if not patch.model_dump(exclude_none=True, exclude={"conversational_summary"}):
+            await message.answer("I could not identify a change. Please be specific, such as ‘include Madhapur’ or ‘maximum rent 25k’.")
+            return
+        version = req_service.update_live_search(user_id, session["id"], patch, message.text)
+    except ValueError as error:
+        await message.answer(str(error))
+        return
+    except RuntimeError as error:
+        await message.answer(str(error))
+        return
+
+    summary = patch.conversational_summary or "Updated your search"
+    await message.answer(f"{summary}. I am checking the inventory again (search version {version}).")
+    await state.clear()
 @router.message(Command("set_availability"))
 async def cmd_set_availability(message: Message, state: FSMContext):
     await message.answer("When are you generally free to visit properties? (e.g., 'Weekends anytime, weekdays after 6 PM')")
@@ -250,7 +324,7 @@ async def process_requirement(message: Message, state: FSMContext):
         async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
             parsed_reqs = await req_service.parse_requirements(full_conversation)
         
-        if not parsed_reqs.is_complete:
+        if not parsed_reqs.is_complete or req_service.missing_core_requirements(parsed_reqs):
             bot_reply = parsed_reqs.follow_up_question or "Could you tell me a bit more about the area and budget you have in mind?"
             await message.answer(bot_reply)
             
@@ -259,9 +333,9 @@ async def process_requirement(message: Message, state: FSMContext):
             return
             
         summary = parsed_reqs.conversational_summary or "Got it! I have all the details I need."
-        
+        draft = req_service.create_draft_search(user_id, parsed_reqs, full_conversation)
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🚀 Start Search", callback_data="action_start_search")]
+            [InlineKeyboardButton(text="Start Search", callback_data=f"search:start:{draft.id}")]
         ])
         
         await message.answer(
@@ -277,7 +351,8 @@ async def process_requirement(message: Message, state: FSMContext):
             chat_history=chat_history,
             parsed_reqs=parsed_reqs.model_dump(),
             user_id=user_id,
-            full_conversation=full_conversation
+            full_conversation=full_conversation,
+            search_id=str(draft.id)
         )
         await state.set_state(RenterState.collecting_extras)
         
@@ -295,12 +370,12 @@ async def process_extras(message: Message, state: FSMContext):
     if user_text in DONE_PHRASES:
         from app.requirements.schemas import RequirementExtractionResponse
         parsed_reqs = RequirementExtractionResponse(**data["parsed_reqs"])
-        
-        if parsed_reqs.max_rent is None:
-            parsed_reqs.max_rent = 999999
-            
         full_conversation = data.get("full_conversation", "\n".join(chat_history))
-        session = req_service.create_search(user_id, parsed_reqs, full_conversation)
+        try:
+            session = req_service.activate_search(user_id, data["search_id"])
+        except ValueError as error:
+            await message.answer(f"I still need a little more information before starting: {error}")
+            return
         tracer.log_event(
             event_type="SEARCH_STARTED",
             override_telegram_user_id=message.from_user.id,
@@ -326,9 +401,15 @@ async def process_extras(message: Message, state: FSMContext):
     try:
         async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
             parsed_reqs = await req_service.parse_requirements(full_conversation)
-        
+        if req_service.missing_core_requirements(parsed_reqs):
+            await message.answer(parsed_reqs.follow_up_question or "Please add the missing core search details before we start.")
+            return
+        search_id = data.get("search_id")
+        if not search_id:
+            raise ValueError("Your saved draft expired. Please restart with /start.")
+        req_service.update_draft_search(user_id, search_id, parsed_reqs, full_conversation)
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🚀 Start Search", callback_data="action_start_search")]
+            [InlineKeyboardButton(text="Start Search", callback_data=f"search:start:{search_id}")]
         ])
         
         summary = parsed_reqs.conversational_summary or "✅ Noted! I'll factor that into your search."
@@ -344,7 +425,8 @@ async def process_extras(message: Message, state: FSMContext):
         await state.update_data(
             chat_history=chat_history,
             parsed_reqs=parsed_reqs.model_dump(),
-            full_conversation=full_conversation
+            full_conversation=full_conversation,
+            search_id=search_id
         )
         
     except Exception as e:
@@ -366,103 +448,145 @@ async def process_availability(message: Message, state: FSMContext):
     finally:
         await state.clear()
 
-@router.callback_query(F.data == "action_start_search")
+@router.callback_query(F.data.startswith("search:start:"))
 async def process_start_search_callback(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    if "parsed_reqs" not in data:
-        await callback.answer("Oops! Something went wrong. Try restarting with /start.", show_alert=True)
+    """Activate only the draft owned by the Telegram user pressing this button."""
+    search_id = callback.data.removeprefix("search:start:")
+    db = get_supabase_client()
+    user_result = db.table("users").select("id").eq("telegram_user_id", callback.from_user.id).execute()
+    if not user_result.data:
+        await callback.answer("This confirmation is no longer valid. Please start again.", show_alert=True)
         return
-        
-    chat_history = data.get("chat_history", [])
-    user_id = data.get("user_id")
-    
-    from app.requirements.schemas import RequirementExtractionResponse
-    parsed_reqs = RequirementExtractionResponse(**data["parsed_reqs"])
-    
-    if parsed_reqs.max_rent is None:
-        parsed_reqs.max_rent = 999999
-        
-    full_conversation = data.get("full_conversation", "\n".join(chat_history))
-    session = req_service.create_search(user_id, parsed_reqs, full_conversation)
+    try:
+        session = req_service.activate_search(user_result.data[0]["id"], search_id)
+    except ValueError as error:
+        await callback.message.answer(f"I could not start this search: {error}")
+        await callback.answer()
+        return
     tracer.log_event(
         event_type="SEARCH_STARTED",
         override_telegram_user_id=callback.from_user.id,
         payload={"search_id": str(session.id)},
-        override_search_id=str(session.id)
+        override_search_id=str(session.id),
     )
-    
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
-        
     await callback.message.answer(
-        "🚀 <b>Your search is live!</b>\n\n"
-        "I'll message you right here as soon as I find a matching property. "
-        "Sit back and relax — I'm on it!",
-        parse_mode="HTML"
+        "Your search is live. I am checking the current Hyderabad inventory and will keep watching approved listings.",
+        parse_mode="HTML",
     )
     await state.clear()
     await callback.answer()
-
 # ─── CALLBACK QUERIES ───
 
-@router.callback_query(F.data.startswith("contact_"))
+async def _callback_owns_search(callback: CallbackQuery, search_id: str) -> bool:
+    """Authorize sensitive callbacks against persisted Telegram-user ownership."""
+    db = get_supabase_client()
+    user = db.table("users").select("id").eq("telegram_user_id", callback.from_user.id).execute()
+    if not user.data:
+        return False
+    search = db.table("search_sessions").select("id").eq("id", search_id).eq("user_id", user.data[0]["id"]).execute()
+    return bool(search.data)
+
+
+def _match_id_from_callback(callback_data: str | None, action: str) -> str | None:
+    """Extract and validate the UUID carried by a renter match action."""
+    from uuid import UUID
+
+    prefix = f"{action}_match_"
+    if not callback_data or not callback_data.startswith(prefix):
+        return None
+    match_id = callback_data.removeprefix(prefix)
+    try:
+        UUID(match_id)
+    except (TypeError, ValueError):
+        return None
+    return match_id
+
+
+async def _callback_owned_match(callback: CallbackQuery, match_id: str) -> dict | None:
+    db = get_supabase_client()
+    result = db.table("matches").select("id,search_id,listing_id").eq("id", match_id).execute()
+    if not result.data:
+        return None
+    match = result.data[0]
+    if not await _callback_owns_search(callback, match["search_id"]):
+        return None
+    return match
+
+
+@router.callback_query(F.data.startswith("contact_match_"))
 async def process_contact_callback(callback: CallbackQuery):
     from app.qualification.service import QualificationService
-    
-    data_parts = callback.data.split("_")
-    search_id = data_parts[1]
-    listing_id = data_parts[2]
-    
+
+    match_id = _match_id_from_callback(callback.data, "contact")
+    match = await _callback_owned_match(callback, match_id) if match_id else None
+    if not match:
+        await callback.answer("This action is not available for your search.", show_alert=True)
+        return
+    search_id, listing_id = match["search_id"], match["listing_id"]
     db = get_supabase_client()
     contacts_res = db.table("contacts").select("id").eq("listing_id", listing_id).execute()
-    
     if not contacts_res.data:
-        await callback.message.answer("This property doesn't have any contacts listed.")
+        await callback.message.answer("This property does not have a contact listed.")
         await callback.answer()
         return
-        
-    contact_id = contacts_res.data[0]['id']
-    
+
     qual_service = QualificationService()
-    conv_id = qual_service.start_conversation(search_id, listing_id, contact_id)
-    
-    await callback.message.answer(f"Started qualification conversation! ID: {conv_id}. I will reach out to them now.")
-    
-    outreach_msg = await qual_service.generate_initial_outreach(conv_id)
-    await callback.message.answer(f"Drafted and sent outreach: \n\n{outreach_msg}")
-    
+    conv_id = qual_service.start_conversation(search_id, listing_id, contacts_res.data[0]["id"])
+    await callback.message.answer("I have started qualifying this property and will update you here.")
+    await qual_service.generate_initial_outreach(conv_id)
     await callback.answer()
+
 
 @router.callback_query(F.data.startswith("visit_confirm_"))
 async def process_visit_confirm(callback: CallbackQuery):
-    visit_id = callback.data.split("_")[2]
-    
-    from app.scheduling.service import SchedulingService
-    sched = SchedulingService()
-    sched.confirm_visit(visit_id)
-    
+    visit_id = callback.data.removeprefix("visit_confirm_")
     db = get_supabase_client()
+    visit = db.table("visits").select("search_id").eq("id", visit_id).execute()
+    if not visit.data or not await _callback_owns_search(callback, visit.data[0]["search_id"]):
+        await callback.answer("This visit is not available for your search.", show_alert=True)
+        return
+    from app.scheduling.service import SchedulingService
+    SchedulingService().confirm_visit(visit_id)
     db.table("agent_jobs").insert({
-        "job_type": "EMAIL_CONFIRM_VISIT",
-        "status": "PENDING",
-        "payload": {"visit_id": visit_id},
-        "run_after": "now()"
+        "job_type": "EMAIL_CONFIRM_VISIT", "status": "PENDING", "payload": {"visit_id": visit_id},
+        "run_after": datetime.now(timezone.utc).isoformat(),
     }).execute()
-    
-    await callback.message.edit_text("✅ Visit Confirmed! I've let the landlord know.")
+    await callback.message.edit_text("✅ Visit confirmed! I have let the landlord know.")
     await callback.answer()
+
 
 @router.callback_query(F.data.startswith("visit_decline_"))
 async def process_visit_decline(callback: CallbackQuery):
-    visit_id = callback.data.split("_")[2]
-    
+    visit_id = callback.data.removeprefix("visit_decline_")
+    db = get_supabase_client()
+    visit = db.table("visits").select("search_id").eq("id", visit_id).execute()
+    if not visit.data or not await _callback_owns_search(callback, visit.data[0]["search_id"]):
+        await callback.answer("This visit is not available for your search.", show_alert=True)
+        return
     from app.scheduling.service import SchedulingService
-    sched = SchedulingService()
-    sched.cancel_visit(visit_id)
-    
-    await callback.message.edit_text("❌ Visit Declined. We will continue the search.")
+    SchedulingService().cancel_visit(visit_id)
+    await callback.message.edit_text("❌ Visit declined. We will continue the search.")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("skip_match_"))
+async def process_skip_callback(callback: CallbackQuery):
+    match_id = _match_id_from_callback(callback.data, "skip")
+    match = await _callback_owned_match(callback, match_id) if match_id else None
+    if not match:
+        await callback.answer("This result is not available for your search.", show_alert=True)
+        return
+    db = get_supabase_client()
+    db.table("matches").update({"status": "SKIPPED"}).eq("id", match["id"]).execute()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer("Skipped. I will keep looking for a better fit.")
     await callback.answer()
 
 # ─── FALLBACK (must be LAST) ───
@@ -472,5 +596,5 @@ async def renter_fallback(message: Message):
     await message.answer(
         "I didn't quite catch that. Type /help to see what I can do, "
         "or say <b>hi</b> to start searching for a flat!",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )

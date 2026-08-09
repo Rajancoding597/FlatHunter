@@ -1,0 +1,7 @@
+{
+  "name": "Kondapur private room from two information screenshots",
+  "inputs": [
+    "../../../groq_vision/samples/6323322407233459435.jpg",
+    "../../../groq_vision/samples/6323322407233459436.jpg"
+  ]
+}

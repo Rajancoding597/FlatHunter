@@ -1,8 +1,8 @@
 -- Enums
 CREATE TYPE user_role AS ENUM ('RENTER', 'ADMIN');
-CREATE TYPE search_status AS ENUM ('ACTIVE', 'PAUSED', 'CLOSED');
+CREATE TYPE search_status AS ENUM ('DRAFT', 'ACTIVE', 'PAUSED', 'CLOSED');
 CREATE TYPE listing_type AS ENUM ('ENTIRE_PROPERTY', 'PRIVATE_ROOM', 'SHARED_ROOM');
-CREATE TYPE content_type AS ENUM ('PROPERTY_LISTING', 'RENTER_REQUIREMENT', 'UNKNOWN');
+CREATE TYPE content_type AS ENUM ('PROPERTY_LISTING', 'RENTER_REQUIREMENT', 'OTHER', 'UNKNOWN');
 CREATE TYPE availability_status AS ENUM ('UNKNOWN', 'AVAILABLE', 'UNAVAILABLE', 'STALE');
 CREATE TYPE preference_importance AS ENUM ('REQUIRED', 'PREFERRED', 'DOES_NOT_MATTER');
 CREATE TYPE match_status AS ENUM ('REJECTED', 'POSSIBLE_MATCH', 'STRONG_MATCH', 'NEEDS_QUALIFICATION', 'QUALIFIED', 'SKIPPED');
@@ -26,10 +26,12 @@ CREATE TABLE search_sessions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID REFERENCES users(id),
     status search_status NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
     city TEXT NOT NULL DEFAULT 'Hyderabad',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     started_at TIMESTAMPTZ,
+    last_activated_at TIMESTAMPTZ,
     paused_at TIMESTAMPTZ,
     closed_at TIMESTAMPTZ
 );
@@ -84,6 +86,7 @@ CREATE TABLE ingestion_inputs (
     telegram_file_id TEXT,
     telegram_file_unique_id TEXT,
     text_content TEXT,
+    caption TEXT,
     is_information_bearing BOOLEAN NOT NULL DEFAULT TRUE,
     sort_order INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -114,6 +117,7 @@ CREATE TABLE listings (
     room_occupancy TEXT,
     rent INTEGER NOT NULL,
     maintenance INTEGER,
+    maintenance_mandatory BOOLEAN,
     deposit INTEGER,
     brokerage INTEGER,
     currency TEXT NOT NULL DEFAULT 'INR',
@@ -131,6 +135,7 @@ CREATE TABLE listings (
     extracted_context JSONB NOT NULL DEFAULT '{}',
     source_summary TEXT,
     created_from_draft_id UUID REFERENCES listing_drafts(id),
+    version INTEGER NOT NULL DEFAULT 1,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -189,6 +194,9 @@ CREATE TABLE matches (
     positive_reasons JSONB NOT NULL DEFAULT '[]',
     missing_information JSONB NOT NULL DEFAULT '[]',
     soft_context_evaluation JSONB NOT NULL DEFAULT '{}',
+    score_breakdown JSONB NOT NULL DEFAULT '{}',
+    search_version INTEGER NOT NULL DEFAULT 1,
+    listing_version INTEGER NOT NULL DEFAULT 1,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE(search_id, listing_id)
@@ -250,12 +258,15 @@ CREATE TABLE visits (
 CREATE TABLE agent_jobs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     job_type TEXT NOT NULL,
+    idempotency_key TEXT UNIQUE,
     status TEXT NOT NULL,
     payload JSONB NOT NULL,
     run_after TIMESTAMPTZ NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
     locked_at TIMESTAMPTZ,
+    locked_by TEXT,
+    completed_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -283,3 +294,37 @@ CREATE INDEX idx_matches_search_id_status ON matches(search_id, status);
 CREATE INDEX idx_matches_listing_id ON matches(listing_id);
 CREATE INDEX idx_conversations_status_last_message_at ON conversations(status, last_message_at);
 CREATE INDEX idx_agent_jobs_status_run_after ON agent_jobs(status, run_after);
+CREATE INDEX idx_agent_jobs_idempotency_key ON agent_jobs(idempotency_key);
+
+-- Atomically claims one due job. SKIP LOCKED prevents concurrent workers from
+-- processing the same job after retries or a process restart.
+CREATE OR REPLACE FUNCTION claim_next_agent_job(p_worker_id TEXT)
+RETURNS SETOF agent_jobs
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    claimed_job agent_jobs%ROWTYPE;
+BEGIN
+    SELECT * INTO claimed_job
+    FROM agent_jobs
+    WHERE status = 'PENDING' AND run_after <= now()
+    ORDER BY run_after, created_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1;
+
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
+
+    UPDATE agent_jobs
+    SET status = 'RUNNING',
+        locked_at = now(),
+        locked_by = p_worker_id,
+        attempts = claimed_job.attempts + 1,
+        updated_at = now()
+    WHERE id = claimed_job.id
+    RETURNING * INTO claimed_job;
+
+    RETURN NEXT claimed_job;
+END;
+$$;

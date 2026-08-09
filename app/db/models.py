@@ -24,10 +24,12 @@ class SearchSession(DBModel):
     id: UUID
     user_id: UUID
     status: SearchStatus
+    version: int = 1
     city: str
     created_at: datetime
     updated_at: datetime
     started_at: Optional[datetime] = None
+    last_activated_at: Optional[datetime] = None
     paused_at: Optional[datetime] = None
     closed_at: Optional[datetime] = None
 
@@ -84,6 +86,7 @@ class Listing(DBModel):
     room_occupancy: Optional[str] = None
     rent: int
     maintenance: Optional[int] = None
+    maintenance_mandatory: Optional[bool] = None
     deposit: Optional[int] = None
     brokerage: Optional[int] = None
     currency: str = "INR"
@@ -101,6 +104,7 @@ class Listing(DBModel):
     extracted_context: Dict[str, Any] = {}
     source_summary: Optional[str] = None
     created_from_draft_id: Optional[UUID] = None
+    version: int = 1
     created_at: datetime
     updated_at: datetime
 
@@ -115,6 +119,9 @@ class Match(DBModel):
     positive_reasons: List[Any] = []
     missing_information: List[Any] = []
     soft_context_evaluation: Dict[str, Any] = {}
+    score_breakdown: Dict[str, Any] = {}
+    search_version: int = 1
+    listing_version: int = 1
     created_at: datetime
     updated_at: datetime
 
@@ -134,11 +141,14 @@ class Conversation(DBModel):
 class AgentJob(DBModel):
     id: UUID
     job_type: str
+    idempotency_key: Optional[str] = None
     status: str
     payload: Dict[str, Any]
     run_after: datetime
     attempts: int = 0
     last_error: Optional[str] = None
     locked_at: Optional[datetime] = None
+    locked_by: Optional[str] = None
+    completed_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
